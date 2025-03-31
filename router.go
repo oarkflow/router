@@ -62,7 +62,7 @@ func compressData(c *fiber.Ctx, data []byte) ([]byte, error) {
 type Static struct {
 	Prefix       string `json:"prefix"`
 	Directory    string `json:"directory"`
-	CacheControl string // Added field for Cache-Control header
+	CacheControl string
 }
 
 type Router struct {
@@ -73,7 +73,6 @@ type Router struct {
 	lock              sync.RWMutex
 	NotFoundHandler   fiber.Handler
 
-	// Enhancement: cache for static file contents
 	staticCache map[string][]byte
 }
 
@@ -81,7 +80,7 @@ func New(app *fiber.App) *Router {
 	dr := &Router{
 		app:         app,
 		routes:      make(map[string]map[string]*Route),
-		staticCache: make(map[string][]byte), // initialize cache
+		staticCache: make(map[string][]byte),
 	}
 	app.All("/*", dr.dispatch)
 	return dr
@@ -309,4 +308,69 @@ func (dr *Router) ListRoutes() []string {
 		}
 	}
 	return routesList
+}
+
+type Group struct {
+	prefix      string
+	middlewares []fiber.Handler
+	router      *Router
+}
+
+func (g *Group) Group(prefix string, m ...fiber.Handler) *Group {
+	newPrefix := g.prefix + prefix
+	newMiddlewares := append([]fiber.Handler{}, g.middlewares...)
+	newMiddlewares = append(newMiddlewares, m...)
+	return &Group{
+		prefix:      newPrefix,
+		middlewares: newMiddlewares,
+		router:      g.router,
+	}
+}
+
+func (g *Group) AddRoute(method, path string, handler fiber.Handler, m ...fiber.Handler) {
+	allMiddlewares := append([]fiber.Handler{}, g.middlewares...)
+	allMiddlewares = append(allMiddlewares, m...)
+	fullPath := g.prefix + path
+	g.router.AddRoute(method, fullPath, handler, allMiddlewares...)
+}
+
+func (g *Group) Get(path string, handler fiber.Handler, m ...fiber.Handler) {
+	g.AddRoute("GET", path, handler, m...)
+}
+
+func (g *Group) Post(path string, handler fiber.Handler, m ...fiber.Handler) {
+	g.AddRoute("POST", path, handler, m...)
+}
+
+func (g *Group) Put(path string, handler fiber.Handler, m ...fiber.Handler) {
+	g.AddRoute("PUT", path, handler, m...)
+}
+
+func (g *Group) Delete(path string, handler fiber.Handler, m ...fiber.Handler) {
+	g.AddRoute("DELETE", path, handler, m...)
+}
+
+func (g *Group) Patch(path string, handler fiber.Handler, m ...fiber.Handler) {
+	g.AddRoute("PATCH", path, handler, m...)
+}
+
+func (g *Group) Options(path string, handler fiber.Handler, m ...fiber.Handler) {
+	g.AddRoute("OPTIONS", path, handler, m...)
+}
+
+func (g *Group) Head(path string, handler fiber.Handler, m ...fiber.Handler) {
+	g.AddRoute("HEAD", path, handler, m...)
+}
+
+func (g *Group) Static(prefix, directory string, cfg ...StaticConfig) {
+	fullPrefix := g.prefix + prefix
+	g.router.Static(fullPrefix, directory, cfg...)
+}
+
+func (dr *Router) Group(prefix string, m ...fiber.Handler) *Group {
+	return &Group{
+		prefix:      prefix,
+		middlewares: m,
+		router:      dr,
+	}
 }
