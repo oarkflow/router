@@ -90,8 +90,12 @@ func main() {
 				}
 				if relativePath != "" {
 					rootPath := filepath.Join(rc.Prefix, relativePath)
-					dynamicRouter.Static(rootPath, path)
-					dynamicRouter.Static(relativePath, path)
+					dynamicRouter.Static(rootPath, path, router.StaticConfig{
+						Compress: true,
+					})
+					dynamicRouter.Static(relativePath, path, router.StaticConfig{
+						Compress: true,
+					})
 				}
 			}
 			return nil

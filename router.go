@@ -2,12 +2,15 @@ package router
 
 import (
 	"log"
+	"mime"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	
+
 	"github.com/gofiber/fiber/v2"
+
+	"github.com/oarkflow/router/utils"
 )
 
 type Route struct {
@@ -23,11 +26,34 @@ func (dr *Route) Serve(c *fiber.Ctx, router *Router, globalMWs ...fiber.Handler)
 	chain = append(chain, globalMWs...)
 	chain = append(chain, dr.Middlewares...)
 	chain = append(chain, dr.Handler)
-	
 	c.Locals("chain_handlers", chain)
 	c.Locals("chain_index", 0)
-	
-	return router.Next(c)
+	err := router.Next(c)
+	if err != nil {
+		return err
+	}
+	body := c.Response().Body()
+	if len(body) > 0 {
+		enc := c.Get("Accept-Encoding")
+		var comp []byte
+		var encoding string
+		if strings.Contains(enc, "br") {
+			if compressed, err := utils.CompressBrotli(body); err == nil {
+				comp = compressed
+				encoding = "br"
+			}
+		} else if strings.Contains(enc, "gzip") {
+			if compressed, err := utils.CompressGzip(body); err == nil {
+				comp = compressed
+				encoding = "gzip"
+			}
+		}
+		if encoding != "" {
+			c.Response().Header.Set("Content-Encoding", encoding)
+			c.Response().SetBodyRaw(comp)
+		}
+	}
+	return nil
 }
 
 type Static struct {
@@ -87,11 +113,34 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 			relativePath := strings.TrimPrefix(path, sr.Prefix)
 			filePath := filepath.Join(sr.Directory, relativePath)
 			if _, err := os.Stat(filePath); err == nil {
-				return c.SendFile(filePath)
+				if mimeType := mime.TypeByExtension(filepath.Ext(filePath)); mimeType != "" {
+					c.Response().Header.Set("Content-Type", mimeType)
+				}
+				data, err := os.ReadFile(filePath)
+				if err != nil {
+					return c.Status(500).SendString("Error reading file")
+				}
+				compData := data
+				enc := c.Get("Accept-Encoding")
+				var encoding string
+				if strings.Contains(enc, "br") {
+					if compressed, err := utils.CompressBrotli(data); err == nil {
+						compData = compressed
+						encoding = "br"
+					}
+				} else {
+					if compressed, err := utils.CompressGzip(data); err == nil {
+						compData = compressed
+						encoding = "gzip"
+					}
+				}
+				if encoding != "" {
+					c.Response().Header.Set("Content-Encoding", encoding)
+				}
+				return c.Send(compData)
 			}
 		}
 	}
-	
 	if dr.NotFoundHandler != nil {
 		return dr.NotFoundHandler(c)
 	}
