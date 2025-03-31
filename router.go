@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-
+	
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -23,10 +23,10 @@ func (dr *Route) Serve(c *fiber.Ctx, router *Router, globalMWs ...fiber.Handler)
 	chain = append(chain, globalMWs...)
 	chain = append(chain, dr.Middlewares...)
 	chain = append(chain, dr.Handler)
-
+	
 	c.Locals("chain_handlers", chain)
 	c.Locals("chain_index", 0)
-
+	
 	return router.Next(c)
 }
 
@@ -41,6 +41,7 @@ type Router struct {
 	staticRoutes      []Static
 	GlobalMiddlewares []fiber.Handler
 	lock              sync.RWMutex
+	NotFoundHandler   fiber.Handler
 }
 
 func New(app *fiber.App) *Router {
@@ -89,6 +90,10 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 				return c.SendFile(filePath)
 			}
 		}
+	}
+	
+	if dr.NotFoundHandler != nil {
+		return dr.NotFoundHandler(c)
 	}
 	return c.Status(fiber.StatusNotFound).SendString("Dynamic route not found")
 }
@@ -194,7 +199,13 @@ func (dr *Router) SetRenderer(method, path string, renderer fiber.Views) {
 	log.Printf("Route not found for setting renderer: %s %s", method, path)
 }
 
-func (dr *Router) AddStaticRoute(prefix, directory string) {
+type StaticConfig struct {
+	Compress     bool
+	ByteRange    bool
+	CacheControl string
+}
+
+func (dr *Router) Static(prefix, directory string, cfg ...StaticConfig) {
 	dr.lock.Lock()
 	defer dr.lock.Unlock()
 	dr.staticRoutes = append(dr.staticRoutes, Static{
@@ -202,4 +213,37 @@ func (dr *Router) AddStaticRoute(prefix, directory string) {
 		Directory: directory,
 	})
 	log.Printf("Added static route: %s -> %s", prefix, directory)
+}
+
+func (dr *Router) RemoveRoute(method, path string) {
+	dr.lock.Lock()
+	defer dr.lock.Unlock()
+	method = strings.ToUpper(method)
+	if methodRoutes, ok := dr.routes[method]; ok {
+		if _, exists := methodRoutes[path]; exists {
+			delete(methodRoutes, path)
+			log.Printf("Removed dynamic route: %s %s", method, path)
+			return
+		}
+	}
+	log.Printf("Route not found for removal: %s %s", method, path)
+}
+
+func (dr *Router) SetNotFoundHandler(handler fiber.Handler) {
+	dr.lock.Lock()
+	defer dr.lock.Unlock()
+	dr.NotFoundHandler = handler
+	log.Println("Custom NotFoundHandler set")
+}
+
+func (dr *Router) ListRoutes() []string {
+	dr.lock.RLock()
+	defer dr.lock.RUnlock()
+	var routesList []string
+	for method, routes := range dr.routes {
+		for path := range routes {
+			routesList = append(routesList, method+" "+path)
+		}
+	}
+	return routesList
 }

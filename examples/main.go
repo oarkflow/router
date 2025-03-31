@@ -66,6 +66,12 @@ func main() {
 	app.Static("/public", "./public")
 
 	dynamicRouter := router.New(app)
+
+	// new: Set a custom NotFoundHandler to serve a JSON error response.
+	dynamicRouter.SetNotFoundHandler(func(c *fiber.Ctx) error {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Custom 404: Route not found"})
+	})
+
 	rendererJSON, err := os.ReadFile("renderer.json")
 	if err != nil {
 		panic(err)
@@ -84,8 +90,8 @@ func main() {
 				}
 				if relativePath != "" {
 					rootPath := filepath.Join(rc.Prefix, relativePath)
-					dynamicRouter.AddStaticRoute(rootPath, path)
-					dynamicRouter.AddStaticRoute(relativePath, path)
+					dynamicRouter.Static(rootPath, path)
+					dynamicRouter.Static(relativePath, path)
 				}
 			}
 			return nil
@@ -131,5 +137,7 @@ func main() {
 		time.Sleep(40 * time.Second)
 		dynamicRouter.RenameRoute("GET", "/hello", "/greetings")
 	}()
+	// new (optional): Log registered routes for debugging.
+	log.Println("Registered routes:", dynamicRouter.ListRoutes())
 	log.Fatal(app.Listen(":3000"))
 }
