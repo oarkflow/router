@@ -1,12 +1,15 @@
 package main
 
 import (
-	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/oarkflow/json"
+	v2 "github.com/oarkflow/json/jsonschema/v2"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/template/html/v2"
@@ -25,13 +28,14 @@ type RendererConfig struct {
 }
 
 type APIRoute struct {
-	RouteURI    string                 `json:"route_uri"`
-	RouteMethod string                 `json:"route_method"`
-	Description string                 `json:"description"`
-	Model       string                 `json:"model"`
-	Operation   string                 `json:"operation"`
-	HandlerKey  string                 `json:"handler_key"`
-	Request     map[string]interface{} `json:"request,omitempty"`
+	RouteURI    string            `json:"route_uri"`
+	RouteMethod string            `json:"route_method"`
+	Description string            `json:"description"`
+	Model       string            `json:"model"`
+	Operation   string            `json:"operation"`
+	HandlerKey  string            `json:"handler_key"`
+	Schema      json.RawMessage   `json:"schema,omitempty"` // JSON Schema for request validation
+	Rules       map[string]string `json:"rules,omitempty"`
 }
 
 type APIEndpoints struct {
@@ -58,20 +62,48 @@ var handlerMapping = map[string]fiber.Handler{
 	},
 }
 
-func main() {
+var (
+	dynamicRouter *router.Router
+	app           *fiber.App
+)
+
+func init() {
 	defaultEngine := html.New("./static/dist", ".html")
-	app := fiber.New(fiber.Config{
+	app = fiber.New(fiber.Config{
 		Views: defaultEngine,
 	})
 	app.Static("/public", "./public")
+	dynamicRouter = router.New(app)
+}
 
-	dynamicRouter := router.New(app)
+func schemaValidator(rawSchema json.RawMessage) fiber.Handler {
+	compiler := v2.NewCompiler()
+	schema, err := compiler.Compile(rawSchema)
+	return func(c *fiber.Ctx) error {
+		if err != nil {
+			return fmt.Errorf("failed to compile schema: %v", err)
+		}
+		var intermediate any
+		if err := json.Unmarshal(c.Body(), &intermediate); err != nil {
+			return fmt.Errorf("failed to unmarshal into intermediate: %v", err)
+		}
+		merged, err := schema.SmartUnmarshal(intermediate)
+		if err != nil {
+			return fmt.Errorf("failed to unmarshal: %v", err)
+		}
+		mergedBytes, err := json.Marshal(merged)
+		if err != nil {
+			return fmt.Errorf("failed to marshal merged result: %v", err)
+		}
+		c.Request().SetBody(mergedBytes)
+		return dynamicRouter.Next(c)
+	}
+}
 
-	// new: Set a custom NotFoundHandler to serve a JSON error response.
+func main() {
 	dynamicRouter.SetNotFoundHandler(func(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Custom 404: Route not found"})
 	})
-
 	rendererJSON, err := os.ReadFile("renderer.json")
 	if err != nil {
 		panic(err)
@@ -128,7 +160,11 @@ func main() {
 			log.Printf("Handler not found for key: %s", route.HandlerKey)
 			continue
 		}
-		dynamicRouter.AddRoute(route.RouteMethod, route.RouteURI, handler)
+		var mws []fiber.Handler
+		if route.Schema != nil {
+			mws = append(mws, schemaValidator(route.Schema))
+		}
+		dynamicRouter.AddRoute(route.RouteMethod, route.RouteURI, handler, mws...)
 	}
 	dynamicRouter.AddRoute("GET", "/hello", func(c *fiber.Ctx) error {
 		return c.SendString("Hello from the dynamic router!")
@@ -143,7 +179,6 @@ func main() {
 		time.Sleep(40 * time.Second)
 		dynamicRouter.RenameRoute("GET", "/hello", "/greetings")
 	}()
-	// new (optional): Log registered routes for debugging.
 	log.Println("Registered routes:", dynamicRouter.ListRoutes())
 	log.Fatal(app.Listen(":3000"))
 }
