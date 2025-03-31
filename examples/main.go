@@ -8,11 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/oarkflow/json"
-	v2 "github.com/oarkflow/json/jsonschema/v2"
-
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/template/html/v2"
+	"github.com/oarkflow/json"
+	v2 "github.com/oarkflow/json/jsonschema/v2"
 
 	"github.com/oarkflow/router"
 )

@@ -84,29 +84,22 @@ func compressData(c *fiber.Ctx, data []byte) ([]byte, error) {
 }
 
 type Static struct {
-	Prefix       string `json:"prefix"`
-	Directory    string `json:"directory"`
-	CacheControl string
-
+	Prefix           string `json:"prefix"`
+	Directory        string `json:"directory"`
+	CacheControl     string
 	DirectoryListing bool
-
 	CompressionLevel int
 }
 
 type Router struct {
-	app  *fiber.App
-	lock sync.RWMutex
-
-	routes map[string]map[string]*Route
-
-	staticRoutes []Static
-
+	app               *fiber.App
+	lock              sync.RWMutex
+	routes            map[string]map[string]*Route
+	staticRoutes      []Static
 	GlobalMiddlewares []middlewareEntry
-
-	NotFoundHandler fiber.Handler
-
-	staticCache     map[string][]byte
-	staticCacheLock sync.RWMutex
+	NotFoundHandler   fiber.Handler
+	staticCache       map[string][]byte
+	staticCacheLock   sync.RWMutex
 }
 
 func New(app *fiber.App) *Router {
@@ -152,22 +145,36 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 	defer dr.lock.RUnlock()
 	method := c.Method()
 	path := c.Path()
-
 	if methodRoutes, ok := dr.routes[method]; ok {
 		if route, exists := methodRoutes[path]; exists {
 			return route.Serve(c, dr, dr.GlobalMiddlewares)
 		}
 	}
-
 	for _, sr := range dr.staticRoutes {
 		if strings.HasPrefix(path, sr.Prefix) {
 			relativePath := strings.TrimPrefix(path, sr.Prefix)
 			filePath := filepath.Join(sr.Directory, relativePath)
 			info, err := os.Stat(filePath)
 			if err == nil && info.IsDir() {
-
 				if sr.DirectoryListing {
-
+					entries, err := os.ReadDir(filePath)
+					if err != nil {
+						log.Printf("error msg=\"Failed to read directory\" error=%v file=%s", err, filePath)
+						return c.Status(500).SendString("Error reading directory")
+					}
+					var builder strings.Builder
+					builder.WriteString("<html><head><meta charset=\"UTF-8\"><title>Directory listing</title></head><body>")
+					builder.WriteString("<h1>Directory listing for " + c.Path() + "</h1><ul>")
+					for _, entry := range entries {
+						name := entry.Name()
+						// Compute a URL path for the entry.
+						entryLink := filepath.Join(c.Path(), name)
+						builder.WriteString(fmt.Sprintf("<li><a href=\"%s\">%s</a></li>", entryLink, name))
+					}
+					builder.WriteString("</ul></body></html>")
+					data := []byte(builder.String())
+					c.Response().Header.Set("Content-Type", "text/html")
+					return c.Send(data)
 				}
 				filePath = filepath.Join(filePath, "index.html")
 			}
@@ -180,7 +187,6 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 					c.Response().Header.Set("Cache-Control", sr.CacheControl)
 				}
 				var data []byte
-
 				dr.staticCacheLock.RLock()
 				cached, found := dr.staticCache[filePath]
 				dr.staticCacheLock.RUnlock()
@@ -190,6 +196,7 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 				} else {
 					d, err := os.ReadFile(filePath)
 					if err != nil {
+						log.Printf("error msg=\"Error reading file\" file=%s error=%v", filePath, err)
 						return c.Status(500).SendString("Error reading file")
 					}
 					data = d
@@ -199,7 +206,8 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 				}
 				compData, err := compressData(c, data)
 				if err != nil {
-					return fmt.Errorf("compression error for static file: %w", err)
+					log.Printf("error msg=\"Compression error\" file=%s error=%v", filePath, err)
+					return c.Status(500).SendString("Compression error")
 				}
 				return c.Send(compData)
 			}
@@ -219,7 +227,6 @@ func (dr *Router) AddRoute(method, path string, handler fiber.Handler, middlewar
 	if dr.routes[method] == nil {
 		dr.routes[method] = make(map[string]*Route)
 	}
-
 	var mwEntries []middlewareEntry
 	for _, m := range middlewares {
 		mwEntries = append(mwEntries, wrapMiddleware(m))
