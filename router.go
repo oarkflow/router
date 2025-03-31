@@ -28,37 +28,41 @@ func (dr *Route) Serve(c *fiber.Ctx, router *Router, globalMWs ...fiber.Handler)
 	chain = append(chain, dr.Handler)
 	c.Locals("chain_handlers", chain)
 	c.Locals("chain_index", 0)
-	err := router.Next(c)
-	if err != nil {
+	if err := router.Next(c); err != nil {
 		return err
 	}
 	body := c.Response().Body()
 	if len(body) > 0 {
-		enc := c.Get("Accept-Encoding")
-		var comp []byte
-		var encoding string
-		if strings.Contains(enc, "br") {
-			if compressed, err := utils.CompressBrotli(body); err == nil {
-				comp = compressed
-				encoding = "br"
-			}
-		} else if strings.Contains(enc, "gzip") {
-			if compressed, err := utils.CompressGzip(body); err == nil {
-				comp = compressed
-				encoding = "gzip"
-			}
+		compData, err := compressData(c, body)
+		if err != nil {
+			return err
 		}
-		if encoding != "" {
-			c.Response().Header.Set("Content-Encoding", encoding)
-			c.Response().SetBodyRaw(comp)
-		}
+		c.Response().SetBodyRaw(compData)
 	}
 	return nil
 }
 
+func compressData(c *fiber.Ctx, data []byte) ([]byte, error) {
+	acceptEncoding := c.Get("Accept-Encoding")
+	if strings.Contains(acceptEncoding, "br") {
+		if compressed, err := utils.CompressBrotli(data); err == nil {
+			c.Response().Header.Set("Content-Encoding", "br")
+			return compressed, nil
+		}
+	}
+	if strings.Contains(acceptEncoding, "gzip") {
+		if compressed, err := utils.CompressGzip(data); err == nil {
+			c.Response().Header.Set("Content-Encoding", "gzip")
+			return compressed, nil
+		}
+	}
+	return data, nil
+}
+
 type Static struct {
-	Prefix    string `json:"prefix"`
-	Directory string `json:"directory"`
+	Prefix       string `json:"prefix"`
+	Directory    string `json:"directory"`
+	CacheControl string // Added field for Cache-Control header
 }
 
 type Router struct {
@@ -68,12 +72,16 @@ type Router struct {
 	GlobalMiddlewares []fiber.Handler
 	lock              sync.RWMutex
 	NotFoundHandler   fiber.Handler
+
+	// Enhancement: cache for static file contents
+	staticCache map[string][]byte
 }
 
 func New(app *fiber.App) *Router {
 	dr := &Router{
-		app:    app,
-		routes: make(map[string]map[string]*Route),
+		app:         app,
+		routes:      make(map[string]map[string]*Route),
+		staticCache: make(map[string][]byte), // initialize cache
 	}
 	app.All("/*", dr.dispatch)
 	return dr
@@ -112,30 +120,31 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 		if strings.HasPrefix(path, sr.Prefix) {
 			relativePath := strings.TrimPrefix(path, sr.Prefix)
 			filePath := filepath.Join(sr.Directory, relativePath)
+			if info, err := os.Stat(filePath); err == nil && info.IsDir() {
+				filePath = filepath.Join(filePath, "index.html")
+			}
 			if _, err := os.Stat(filePath); err == nil {
 				if mimeType := mime.TypeByExtension(filepath.Ext(filePath)); mimeType != "" {
 					c.Response().Header.Set("Content-Type", mimeType)
 				}
-				data, err := os.ReadFile(filePath)
-				if err != nil {
-					return c.Status(500).SendString("Error reading file")
+				if sr.CacheControl != "" {
+					c.Response().Header.Set("Cache-Control", sr.CacheControl)
 				}
-				compData := data
-				enc := c.Get("Accept-Encoding")
-				var encoding string
-				if strings.Contains(enc, "br") {
-					if compressed, err := utils.CompressBrotli(data); err == nil {
-						compData = compressed
-						encoding = "br"
-					}
+				var data []byte
+				if cached, ok := dr.staticCache[filePath]; ok {
+					data = cached
+					log.Printf("Cache hit for file: %s", filePath)
 				} else {
-					if compressed, err := utils.CompressGzip(data); err == nil {
-						compData = compressed
-						encoding = "gzip"
+					d, err := os.ReadFile(filePath)
+					if err != nil {
+						return c.Status(500).SendString("Error reading file")
 					}
+					data = d
+					dr.staticCache[filePath] = data
 				}
-				if encoding != "" {
-					c.Response().Header.Set("Content-Encoding", encoding)
+				compData, err := compressData(c, data)
+				if err != nil {
+					return err
 				}
 				return c.Send(compData)
 			}
@@ -257,9 +266,14 @@ type StaticConfig struct {
 func (dr *Router) Static(prefix, directory string, cfg ...StaticConfig) {
 	dr.lock.Lock()
 	defer dr.lock.Unlock()
+	cacheControl := ""
+	if len(cfg) > 0 {
+		cacheControl = cfg[0].CacheControl
+	}
 	dr.staticRoutes = append(dr.staticRoutes, Static{
-		Prefix:    prefix,
-		Directory: directory,
+		Prefix:       prefix,
+		Directory:    directory,
+		CacheControl: cacheControl,
 	})
 	log.Printf("Added static route: %s -> %s", prefix, directory)
 }

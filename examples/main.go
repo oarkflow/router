@@ -91,10 +91,12 @@ func main() {
 				if relativePath != "" {
 					rootPath := filepath.Join(rc.Prefix, relativePath)
 					dynamicRouter.Static(rootPath, path, router.StaticConfig{
-						Compress: true,
+						Compress:     true,
+						CacheControl: "Cache-Control: public, max-age=86400",
 					})
 					dynamicRouter.Static(relativePath, path, router.StaticConfig{
-						Compress: true,
+						Compress:     true,
+						CacheControl: "Cache-Control: public, max-age=86400",
 					})
 				}
 			}
