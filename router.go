@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 
@@ -91,6 +92,11 @@ type Static struct {
 	CompressionLevel int
 }
 
+type staticCacheEntry struct {
+	data      []byte
+	timestamp time.Time
+}
+
 type Router struct {
 	app               *fiber.App
 	lock              sync.RWMutex
@@ -98,15 +104,17 @@ type Router struct {
 	staticRoutes      []Static
 	GlobalMiddlewares []middlewareEntry
 	NotFoundHandler   fiber.Handler
-	staticCache       map[string][]byte
+	staticCache       map[string]staticCacheEntry
 	staticCacheLock   sync.RWMutex
 }
+
+const staticCacheTTL = 5 * time.Minute
 
 func New(app *fiber.App) *Router {
 	dr := &Router{
 		app:               app,
 		routes:            make(map[string]map[string]*Route),
-		staticCache:       make(map[string][]byte),
+		staticCache:       make(map[string]staticCacheEntry),
 		GlobalMiddlewares: []middlewareEntry{},
 	}
 	app.All("/*", dr.dispatch)
@@ -153,7 +161,9 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 	for _, sr := range dr.staticRoutes {
 		if strings.HasPrefix(path, sr.Prefix) {
 			relativePath := strings.TrimPrefix(path, sr.Prefix)
-			filePath := filepath.Join(sr.Directory, relativePath)
+
+			cleanRelative := filepath.Clean(relativePath)
+			filePath := filepath.Join(sr.Directory, cleanRelative)
 			info, err := os.Stat(filePath)
 			if err == nil && info.IsDir() {
 				if sr.DirectoryListing {
@@ -167,7 +177,7 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 					builder.WriteString("<h1>Directory listing for " + c.Path() + "</h1><ul>")
 					for _, entry := range entries {
 						name := entry.Name()
-						// Compute a URL path for the entry.
+
 						entryLink := filepath.Join(c.Path(), name)
 						builder.WriteString(fmt.Sprintf("<li><a href=\"%s\">%s</a></li>", entryLink, name))
 					}
@@ -182,16 +192,19 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 				ext := filepath.Ext(filePath)
 				if mimeType := mime.TypeByExtension(ext); mimeType != "" {
 					c.Response().Header.Set("Content-Type", mimeType)
+
+					c.Response().Header.Set("X-Content-Type-Options", "nosniff")
 				}
 				if sr.CacheControl != "" {
 					c.Response().Header.Set("Cache-Control", sr.CacheControl)
 				}
 				var data []byte
+
 				dr.staticCacheLock.RLock()
-				cached, found := dr.staticCache[filePath]
+				entry, found := dr.staticCache[filePath]
 				dr.staticCacheLock.RUnlock()
-				if found {
-					data = cached
+				if found && time.Since(entry.timestamp) < staticCacheTTL {
+					data = entry.data
 					log.Printf("info msg=\"Static cache hit\" file=%s", filePath)
 				} else {
 					d, err := os.ReadFile(filePath)
@@ -201,7 +214,7 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 					}
 					data = d
 					dr.staticCacheLock.Lock()
-					dr.staticCache[filePath] = data
+					dr.staticCache[filePath] = staticCacheEntry{data: data, timestamp: time.Now()}
 					dr.staticCacheLock.Unlock()
 				}
 				compData, err := compressData(c, data)

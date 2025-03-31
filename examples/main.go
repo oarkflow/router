@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"time"
@@ -105,7 +106,7 @@ func main() {
 	})
 	rendererJSON, err := os.ReadFile("renderer.json")
 	if err != nil {
-		panic(err)
+		log.Fatalf("Error reading renderer.json: %v", err) // changed from panic
 	}
 	var rendererConfigs []RendererConfig
 	if err := json.Unmarshal(rendererJSON, &rendererConfigs); err != nil {
@@ -147,7 +148,7 @@ func main() {
 	}
 	apiBytes, err := os.ReadFile("api.json")
 	if err != nil {
-		panic(err)
+		log.Fatalf("Error reading api.json: %v", err) // changed from panic
 	}
 	var apiConfig APIEndpoints
 	if err := json.Unmarshal(apiBytes, &apiConfig); err != nil {
@@ -177,6 +178,16 @@ func main() {
 	go func() {
 		time.Sleep(40 * time.Second)
 		dynamicRouter.RenameRoute("GET", "/hello", "/greetings")
+	}()
+	// Add graceful shutdown support:
+	go func() {
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, os.Interrupt)
+		<-quit
+		log.Println("Shutting down gracefully...")
+		if err := app.Shutdown(); err != nil {
+			log.Fatalf("Shutdown error: %v", err)
+		}
 	}()
 	log.Println("Registered routes:", dynamicRouter.ListRoutes())
 	log.Fatal(app.Listen(":3000"))
