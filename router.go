@@ -33,16 +33,14 @@ func middlewareIDsEqual(a fiber.Handler, b middlewareEntry) bool {
 }
 
 type Route struct {
-	Method  string
-	Path    string
-	Handler fiber.Handler
-
+	Method      string
+	Path        string
+	Handler     fiber.Handler
 	Middlewares []middlewareEntry
 	Renderer    fiber.Views
 }
 
-func (dr *Route) Serve(c *fiber.Ctx, router *Router, globalMWs []middlewareEntry) error {
-
+func (dr *Route) Serve(c *fiber.Ctx, globalMWs []middlewareEntry) error {
 	chain := make([]fiber.Handler, 0, len(globalMWs)+len(dr.Middlewares)+1)
 	for _, m := range globalMWs {
 		chain = append(chain, m.handler)
@@ -53,7 +51,7 @@ func (dr *Route) Serve(c *fiber.Ctx, router *Router, globalMWs []middlewareEntry
 	chain = append(chain, dr.Handler)
 	c.Locals("chain_handlers", chain)
 	c.Locals("chain_index", 0)
-	if err := router.Next(c); err != nil {
+	if err := Next(c); err != nil {
 		return fmt.Errorf("chain error: %w", err)
 	}
 	body := c.Response().Body()
@@ -121,7 +119,7 @@ func New(app *fiber.App) *Router {
 	return dr
 }
 
-func (dr *Router) Next(c *fiber.Ctx) error {
+func Next(c *fiber.Ctx) error {
 	idxVal := c.Locals("chain_index")
 	idx, ok := idxVal.(int)
 	if !ok {
@@ -155,21 +153,30 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 	path := c.Path()
 	if methodRoutes, ok := dr.routes[method]; ok {
 		if route, exists := methodRoutes[path]; exists {
-			return route.Serve(c, dr, dr.GlobalMiddlewares)
+			return route.Serve(c, dr.GlobalMiddlewares)
 		}
 	}
 	for _, sr := range dr.staticRoutes {
 		if strings.HasPrefix(path, sr.Prefix) {
 			relativePath := strings.TrimPrefix(path, sr.Prefix)
-
 			cleanRelative := filepath.Clean(relativePath)
 			filePath := filepath.Join(sr.Directory, cleanRelative)
+			absDir, err := filepath.Abs(sr.Directory)
+			if err != nil {
+				log.Printf("error msg=\"Could not resolve absolute directory\" directory=%s error=%v", sr.Directory, err)
+				return c.Status(500).SendString("Internal Server Error")
+			}
+			absFile, err := filepath.Abs(filePath)
+			if err != nil || !strings.HasPrefix(absFile, absDir) {
+				log.Printf("warn msg=\"Attempted directory traversal\" file=%s", filePath)
+				return c.Status(403).SendString("Forbidden")
+			}
 			info, err := os.Stat(filePath)
 			if err == nil && info.IsDir() {
 				if sr.DirectoryListing {
 					entries, err := os.ReadDir(filePath)
 					if err != nil {
-						log.Printf("error msg=\"Failed to read directory\" error=%v file=%s", err, filePath)
+						log.Printf("error msg=\"Failed to read directory\" file=%s error=%v", filePath, err)
 						return c.Status(500).SendString("Error reading directory")
 					}
 					var builder strings.Builder
@@ -177,7 +184,6 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 					builder.WriteString("<h1>Directory listing for " + c.Path() + "</h1><ul>")
 					for _, entry := range entries {
 						name := entry.Name()
-
 						entryLink := filepath.Join(c.Path(), name)
 						builder.WriteString(fmt.Sprintf("<li><a href=\"%s\">%s</a></li>", entryLink, name))
 					}
@@ -192,14 +198,12 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 				ext := filepath.Ext(filePath)
 				if mimeType := mime.TypeByExtension(ext); mimeType != "" {
 					c.Response().Header.Set("Content-Type", mimeType)
-
 					c.Response().Header.Set("X-Content-Type-Options", "nosniff")
 				}
 				if sr.CacheControl != "" {
 					c.Response().Header.Set("Cache-Control", sr.CacheControl)
 				}
 				var data []byte
-
 				dr.staticCacheLock.RLock()
 				entry, found := dr.staticCache[filePath]
 				dr.staticCacheLock.RUnlock()
@@ -226,7 +230,6 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 			}
 		}
 	}
-
 	if dr.NotFoundHandler != nil {
 		return dr.NotFoundHandler(c)
 	}
@@ -408,17 +411,15 @@ type StaticConfig struct {
 }
 
 type GroupRoute struct {
-	method  string
-	relPath string
-	handler fiber.Handler
-
+	method        string
+	relPath       string
+	handler       fiber.Handler
 	routeMWs      []middlewareEntry
 	effectivePath string
 }
 
 type Group struct {
-	prefix string
-
+	prefix      string
 	middlewares []middlewareEntry
 	routes      []*GroupRoute
 	router      *Router
@@ -452,7 +453,6 @@ func (g *Group) AddRoute(method, relPath string, handler fiber.Handler, m ...fib
 		effectivePath: effectivePath,
 	}
 	g.routes = append(g.routes, gr)
-
 	combinedMW := make([]fiber.Handler, 0, len(g.middlewares)+len(routeMWs))
 	for _, m := range g.middlewares {
 		combinedMW = append(combinedMW, m.handler)
@@ -506,16 +506,13 @@ func (g *Group) ChangePrefix(newPrefix string) {
 }
 
 func (g *Group) UpdateMiddlewares(newMW []fiber.Handler) {
-
 	var newWrapped []middlewareEntry
 	for _, m := range newMW {
 		newWrapped = append(newWrapped, wrapMiddleware(m))
 	}
 	g.middlewares = newWrapped
 	for _, gr := range g.routes {
-
 		g.router.RemoveRoute(gr.method, gr.effectivePath)
-
 		combinedMW := make([]fiber.Handler, 0, len(g.middlewares)+len(gr.routeMWs))
 		for _, m := range g.middlewares {
 			combinedMW = append(combinedMW, m.handler)
@@ -523,19 +520,16 @@ func (g *Group) UpdateMiddlewares(newMW []fiber.Handler) {
 		for _, m := range gr.routeMWs {
 			combinedMW = append(combinedMW, m.handler)
 		}
-
 		g.router.AddRoute(gr.method, gr.effectivePath, gr.handler, combinedMW...)
 	}
 	log.Printf("info msg=\"Group middlewares updated\" groupPrefix=%s", g.prefix)
 }
 
 func (g *Group) AddMiddleware(mw ...fiber.Handler) {
-
 	current := make([]fiber.Handler, 0, len(g.middlewares))
 	for _, m := range g.middlewares {
 		current = append(current, m.handler)
 	}
-
 	current = append(current, mw...)
 	g.UpdateMiddlewares(current)
 }
@@ -561,7 +555,6 @@ func (g *Group) RemoveRoute(relPath string) {
 	for i, gr := range g.routes {
 		if gr.relPath == relPath {
 			g.router.RemoveRoute(gr.method, gr.effectivePath)
-
 			g.routes = append(g.routes[:i], g.routes[i+1:]...)
 			log.Printf("info msg=\"Removed group route\" method=%s relPath=%s", gr.method, relPath)
 			return

@@ -96,7 +96,7 @@ func schemaValidator(rawSchema json.RawMessage) fiber.Handler {
 			return fmt.Errorf("failed to marshal merged result: %v", err)
 		}
 		c.Request().SetBody(mergedBytes)
-		return dynamicRouter.Next(c)
+		return router.Next(c)
 	}
 }
 

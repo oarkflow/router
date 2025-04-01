@@ -33,7 +33,7 @@ func main() {
 	}()
 	apiGroup := dynRouter.Group("/api", func(c *fiber.Ctx) error {
 		log.Println("API group middleware executed")
-		return dynRouter.Next(c)
+		return router.Next(c)
 	})
 	apiGroup.Get("/users", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"users": []string{"Alice", "Bob", "Charlie"}})
@@ -52,7 +52,7 @@ func main() {
 		apiGroup.UpdateMiddlewares([]fiber.Handler{
 			func(c *fiber.Ctx) error {
 				log.Println("New API group middleware executed")
-				return dynRouter.Next(c)
+				return router.Next(c)
 			},
 		})
 		log.Println("Updated API group middleware")
