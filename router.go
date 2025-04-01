@@ -47,23 +47,58 @@ func customErrorHandler(c *fiber.Ctx, err error) error {
 }
 
 func matchRoute(pattern, path string) (bool, map[string]string) {
-	patternParts := strings.Split(strings.Trim(pattern, "/"), "/")
-	pathParts := strings.Split(strings.Trim(path, "/"), "/")
-	if len(patternParts) != len(pathParts) {
-		return false, nil
-	}
-	params := map[string]string{}
-	for i := 0; i < len(patternParts); i++ {
-		pp := patternParts[i]
-		ap := pathParts[i]
-		if strings.HasPrefix(pp, ":") {
-			key := pp[1:]
-			params[key] = ap
-		} else if pp != ap {
-			return false, nil
+	params := make(map[string]string)
+	pi, ti := 0, 0
+	pLen, tLen := len(pattern), len(path)
+	skipSlash := func(s string, i int) int {
+		for i < len(s) && s[i] == '/' {
+			i++
 		}
+		return i
 	}
-	return true, params
+	pi = skipSlash(pattern, pi)
+	ti = skipSlash(path, ti)
+	for pi < pLen && ti < tLen {
+		switch pattern[pi] {
+		case ':':
+			startName := pi + 1
+			for pi < pLen && pattern[pi] != '/' {
+				pi++
+			}
+			paramName := pattern[startName:pi]
+			startVal := ti
+			for ti < tLen && path[ti] != '/' {
+				ti++
+			}
+			paramVal := path[startVal:ti]
+			params[paramName] = paramVal
+		case '*':
+			pi++
+			if pi < pLen && pattern[pi] == '/' {
+				pi++
+			}
+			paramName := pattern[pi:]
+			paramVal := path[ti:]
+			params[paramName] = paramVal
+			ti = tLen
+			pi = pLen
+			break
+		default:
+			for pi < pLen && ti < tLen && pattern[pi] != '/' && path[ti] != '/' {
+				if pattern[pi] != path[ti] {
+					return false, nil
+				}
+				pi++
+				ti++
+			}
+		}
+		pi = skipSlash(pattern, pi)
+		ti = skipSlash(path, ti)
+	}
+	if pi == pLen && ti == tLen {
+		return true, params
+	}
+	return false, nil
 }
 
 type Route struct {
@@ -184,7 +219,7 @@ func Next(c *fiber.Ctx) error {
 	}
 	c.Locals("chain_index", idx+1)
 	if err := handlers[idx](c); err != nil {
-		return fmt.Errorf("middleware[%d] error: %w", idx, err)
+		return err
 	}
 	return nil
 }

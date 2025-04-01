@@ -83,6 +83,10 @@ func schemaValidator(rawSchema json.RawMessage) fiber.Handler {
 		if err != nil {
 			return fmt.Errorf("failed to compile schema: %v", err)
 		}
+		body := c.Body()
+		if body == nil {
+
+		}
 		var intermediate any
 		if err := json.Unmarshal(c.Body(), &intermediate); err != nil {
 			return fmt.Errorf("failed to unmarshal into intermediate: %v", err)
