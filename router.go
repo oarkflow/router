@@ -74,11 +74,8 @@ type Route struct {
 	Renderer    fiber.Views
 }
 
-func (dr *Route) Serve(c *fiber.Ctx, globalMWs []middlewareEntry) error {
-	chain := make([]fiber.Handler, 0, len(globalMWs)+len(dr.Middlewares)+1)
-	for _, m := range globalMWs {
-		chain = append(chain, m.handler)
-	}
+func (dr *Route) Serve(c *fiber.Ctx) error {
+	chain := make([]fiber.Handler, 0, len(dr.Middlewares)+1)
 	for _, m := range dr.Middlewares {
 		chain = append(chain, m.handler)
 	}
@@ -192,110 +189,140 @@ func Next(c *fiber.Ctx) error {
 	return nil
 }
 
+func (dr *Router) GetGlobalMiddlewareChain() []fiber.Handler {
+	dr.lock.RLock()
+	defer dr.lock.RUnlock()
+	chain := make([]fiber.Handler, len(dr.GlobalMiddlewares))
+	for i, m := range dr.GlobalMiddlewares {
+		chain[i] = m.handler
+	}
+	return chain
+}
+
+func (dr *Router) UpdateGlobalMiddleware(newMW []fiber.Handler) {
+	var newChain []middlewareEntry
+	for _, m := range newMW {
+		newChain = append(newChain, wrapMiddleware(m))
+	}
+	dr.lock.Lock()
+	dr.GlobalMiddlewares = newChain
+	dr.lock.Unlock()
+	log.Info().Int("count", len(newMW)).Msg("Updated global middleware")
+}
+
 func (dr *Router) Use(mw ...fiber.Handler) {
 	dr.lock.Lock()
-	defer dr.lock.Unlock()
 	for _, m := range mw {
 		dr.GlobalMiddlewares = append(dr.GlobalMiddlewares, wrapMiddleware(m))
 	}
-	log.Info().Int("count", len(mw)).Msg("Added global middleware")
+	dr.lock.Unlock()
+	log.Info().Int("count", len(mw)).Msg("Added to global middleware")
 }
 
 func (dr *Router) dispatch(c *fiber.Ctx) error {
-	dr.lock.RLock()
-	defer dr.lock.RUnlock()
-	method := c.Method()
-	path := c.Path()
+	globalChain := dr.GetGlobalMiddlewareChain()
+	nextFunc := func(c *fiber.Ctx) error {
+		dr.lock.RLock()
+		defer dr.lock.RUnlock()
+		method := c.Method()
+		path := c.Path()
 
-	if mr, ok := dr.routes[method]; ok {
-		if route, exists := mr.exact[path]; exists {
-			return route.Serve(c, dr.GlobalMiddlewares)
-		}
-		for _, route := range mr.params {
-			if matched, params := matchRoute(route.Path, path); matched {
-				c.Locals("params", params)
-				return route.Serve(c, dr.GlobalMiddlewares)
+		if mr, ok := dr.routes[method]; ok {
+			if route, exists := mr.exact[path]; exists {
+				return route.Serve(c)
+			}
+			for _, route := range mr.params {
+				if matched, params := matchRoute(route.Path, path); matched {
+					c.Locals("params", params)
+					return route.Serve(c)
+				}
 			}
 		}
-	}
-	for _, sr := range dr.staticRoutes {
-		if strings.HasPrefix(path, sr.Prefix) {
-			relativePath := strings.TrimPrefix(path, sr.Prefix)
-			cleanRelative := filepath.Clean(relativePath)
-			filePath := filepath.Join(sr.Directory, cleanRelative)
-			absDir, err := filepath.Abs(sr.Directory)
-			if err != nil {
-				log.Error().Err(err).Msg("Could not resolve absolute directory")
-				return c.Status(500).SendString("Internal Server Error")
-			}
-			absFile, err := filepath.Abs(filePath)
-			if err != nil || !strings.HasPrefix(absFile, absDir) {
-				log.Warn().Err(err).Msgf("Attempted directory traversal: %s", filePath)
-				return c.Status(403).SendString("Forbidden")
-			}
-			info, err := os.Stat(filePath)
-			if err == nil && info.IsDir() {
-				if sr.DirectoryListing {
-					entries, err := os.ReadDir(filePath)
-					if err != nil {
-						log.Error().Err(err).Msgf("Failed to read directory: %s", filePath)
-						return c.Status(500).SendString("Error reading directory")
-					}
-					var builder strings.Builder
-					builder.WriteString("<html><head><meta charset=\"UTF-8\"><title>Directory listing</title></head><body>")
-					builder.WriteString("<h1>Directory listing for " + c.Path() + "</h1><ul>")
-					for _, entry := range entries {
-						name := entry.Name()
-						entryLink := filepath.Join(c.Path(), name)
-						builder.WriteString(fmt.Sprintf("<li><a href=\"%s\">%s</a></li>", entryLink, name))
-					}
-					builder.WriteString("</ul></body></html>")
-					data := []byte(builder.String())
-					c.Response().Header.Set("Content-Type", "text/html")
-					return c.Send(data)
-				}
-				filePath = filepath.Join(filePath, "index.html")
-			}
-			if _, err := os.Stat(filePath); err == nil {
-				ext := filepath.Ext(filePath)
-				if mimeType := mime.TypeByExtension(ext); mimeType != "" {
-					c.Response().Header.Set("Content-Type", mimeType)
-					c.Response().Header.Set("X-Content-Type-Options", "nosniff")
-				}
-				if sr.CacheControl != "" {
-					c.Response().Header.Set("Cache-Control", sr.CacheControl)
-				}
-				var data []byte
-				dr.staticCacheLock.RLock()
-				entry, found := dr.staticCache[filePath]
-				dr.staticCacheLock.RUnlock()
-				if found && time.Since(entry.timestamp) < staticCacheTTL {
-					data = entry.data
-					log.Info().Str("file", filePath).Msg("Static cache hit")
-				} else {
-					d, err := os.ReadFile(filePath)
-					if err != nil {
-						log.Error().Err(err).Msgf("Failed to read file: %s", filePath)
-						return c.Status(500).SendString("Error reading file")
-					}
-					data = d
-					dr.staticCacheLock.Lock()
-					dr.staticCache[filePath] = staticCacheEntry{data: data, timestamp: time.Now()}
-					dr.staticCacheLock.Unlock()
-				}
-				compData, err := compressData(c, data)
+
+		for _, sr := range dr.staticRoutes {
+			if strings.HasPrefix(path, sr.Prefix) {
+				relativePath := strings.TrimPrefix(path, sr.Prefix)
+				cleanRelative := filepath.Clean(relativePath)
+				filePath := filepath.Join(sr.Directory, cleanRelative)
+				absDir, err := filepath.Abs(sr.Directory)
 				if err != nil {
-					log.Error().Err(err).Msgf("Failed to compress file: %s", filePath)
-					return c.Status(500).SendString("Compression error")
+					log.Error().Err(err).Msg("Could not resolve absolute directory")
+					return c.Status(500).SendString("Internal Server Error")
 				}
-				return c.Send(compData)
+				absFile, err := filepath.Abs(filePath)
+				if err != nil || !strings.HasPrefix(absFile, absDir) {
+					log.Warn().Err(err).Msgf("Attempted directory traversal: %s", filePath)
+					return c.Status(403).SendString("Forbidden")
+				}
+				info, err := os.Stat(filePath)
+				if err == nil && info.IsDir() {
+					if sr.DirectoryListing {
+						entries, err := os.ReadDir(filePath)
+						if err != nil {
+							log.Error().Err(err).Msgf("Failed to read directory: %s", filePath)
+							return c.Status(500).SendString("Error reading directory")
+						}
+						var builder strings.Builder
+						builder.WriteString("<html><head><meta charset=\"UTF-8\"><title>Directory listing</title></head><body>")
+						builder.WriteString("<h1>Directory listing for " + c.Path() + "</h1><ul>")
+						for _, entry := range entries {
+							name := entry.Name()
+							entryLink := filepath.Join(c.Path(), name)
+							builder.WriteString(fmt.Sprintf("<li><a href=\"%s\">%s</a></li>", entryLink, name))
+						}
+						builder.WriteString("</ul></body></html>")
+						data := []byte(builder.String())
+						c.Response().Header.Set("Content-Type", "text/html")
+						return c.Send(data)
+					}
+					filePath = filepath.Join(filePath, "index.html")
+				}
+				if _, err := os.Stat(filePath); err == nil {
+					ext := filepath.Ext(filePath)
+					if mimeType := mime.TypeByExtension(ext); mimeType != "" {
+						c.Response().Header.Set("Content-Type", mimeType)
+						c.Response().Header.Set("X-Content-Type-Options", "nosniff")
+					}
+					if sr.CacheControl != "" {
+						c.Response().Header.Set("Cache-Control", sr.CacheControl)
+					}
+					var data []byte
+					dr.staticCacheLock.RLock()
+					entry, found := dr.staticCache[filePath]
+					dr.staticCacheLock.RUnlock()
+					if found && time.Since(entry.timestamp) < staticCacheTTL {
+						data = entry.data
+						log.Info().Str("file", filePath).Msg("Static cache hit")
+					} else {
+						d, err := os.ReadFile(filePath)
+						if err != nil {
+							log.Error().Err(err).Msgf("Failed to read file: %s", filePath)
+							return c.Status(500).SendString("Error reading file")
+						}
+						data = d
+						dr.staticCacheLock.Lock()
+						dr.staticCache[filePath] = staticCacheEntry{data: data, timestamp: time.Now()}
+						dr.staticCacheLock.Unlock()
+					}
+					compData, err := compressData(c, data)
+					if err != nil {
+						log.Error().Err(err).Msgf("Failed to compress file: %s", filePath)
+						return c.Status(500).SendString("Compression error")
+					}
+					return c.Send(compData)
+				}
 			}
 		}
+		if dr.NotFoundHandler != nil {
+			return dr.NotFoundHandler(c)
+		}
+		return c.Status(fiber.StatusNotFound).SendString("Dynamic route not found")
 	}
-	if dr.NotFoundHandler != nil {
-		return dr.NotFoundHandler(c)
-	}
-	return c.Status(fiber.StatusNotFound).SendString("Dynamic route not found")
+
+	chain := append(globalChain, nextFunc)
+	c.Locals("chain_handlers", chain)
+	c.Locals("chain_index", 0)
+	return Next(c)
 }
 
 func (dr *Router) AddRoute(method, path string, handler fiber.Handler, middlewares ...fiber.Handler) {

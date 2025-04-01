@@ -16,6 +16,9 @@ func main() {
 		Views: engine,
 	})
 	dynRouter := router.New(app)
+	dynRouter.Use(func(ctx *fiber.Ctx) error {
+		return router.Next(ctx)
+	})
 	dynRouter.SetNotFoundHandler(func(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Custom 404: Route not found",
