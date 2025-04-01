@@ -1,11 +1,11 @@
 package main
 
 import (
-	"log"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/template/html/v2"
+	"github.com/oarkflow/log"
 
 	"github.com/oarkflow/router"
 )
@@ -29,10 +29,10 @@ func main() {
 		dynRouter.UpdateRoute("GET", "/hello", func(c *fiber.Ctx) error {
 			return c.SendString("Hello, world! (updated)")
 		})
-		log.Println("Updated normal route /hello")
+		log.Info().Msg("Updated normal route /hello")
 	}()
 	apiGroup := dynRouter.Group("/api", func(c *fiber.Ctx) error {
-		log.Println("API group middleware executed")
+		log.Info().Msg("API group middleware executed")
 		return router.Next(c)
 	})
 	apiGroup.Get("/users", func(c *fiber.Ctx) error {
@@ -45,17 +45,17 @@ func main() {
 	go func() {
 		time.Sleep(20 * time.Second)
 		apiGroup.ChangePrefix("/v2")
-		log.Println("Changed API group prefix to /v2")
+		log.Info().Msg("Changed API group prefix to /v2")
 	}()
 	go func() {
 		time.Sleep(30 * time.Second)
 		apiGroup.UpdateMiddlewares([]fiber.Handler{
 			func(c *fiber.Ctx) error {
-				log.Println("New API group middleware executed")
+				log.Info().Msg("New API group middleware executed")
 				return router.Next(c)
 			},
 		})
-		log.Println("Updated API group middleware")
+		log.Info().Msg("Updated API group middleware")
 	}()
 	dynRouter.Static("/assets", "./static/dist", router.StaticConfig{
 		Compress:     true,
@@ -67,8 +67,11 @@ func main() {
 			return c.Render("index", fiber.Map{"Title": "Dynamic Renderer"})
 		})
 		dynRouter.SetRenderer("GET", "/renderer", engine)
-		log.Println("Added route /renderer with custom renderer")
+		log.Info().Msg("Added route /renderer with custom renderer")
 	}()
-	log.Println("Registered routes:", dynRouter.ListRoutes())
-	log.Fatal(app.Listen(":3000"))
+	log.Info().Msgf("Registered routes: %v", dynRouter.ListRoutes())
+	err := app.Listen(":3000")
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to start server")
+	}
 }

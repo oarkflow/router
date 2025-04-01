@@ -57,7 +57,7 @@ func main() {
 	// Create an API group with a common prefix and middleware.
 	apiGroup := dynRouter.Group("/api", func(c *fiber.Ctx) error {
 		log.Println("API group middleware executed")
-		return dynRouter.Next(c)
+		return router.Next(c)
 	})
 	// Add a group route.
 	apiGroup.Get("/users", func(c *fiber.Ctx) error {

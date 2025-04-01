@@ -25,7 +25,7 @@ func main() {
 	// Create an API group with a common prefix and a middleware.
 	apiGroup := dynamicRouter.Group("/api", func(c *fiber.Ctx) error {
 		log.Println("API group middleware executed")
-		return dynamicRouter.Next(c)
+		return router.Next(c)
 	})
 
 	// Define API routes under the /api prefix.
@@ -49,7 +49,7 @@ func main() {
 		if c.Query("token") != "secret" {
 			return c.Status(fiber.StatusUnauthorized).SendString("Unauthorized")
 		}
-		return dynamicRouter.Next(c)
+		return router.Next(c)
 	})
 	adminGroup.Get("/dashboard", func(c *fiber.Ctx) error {
 		return c.SendString("Welcome to the admin dashboard!")

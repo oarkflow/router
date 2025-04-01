@@ -2,7 +2,6 @@ package router
 
 import (
 	"fmt"
-	"log"
 	"mime"
 	"os"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/oarkflow/log"
 
 	"github.com/oarkflow/router/utils"
 )
@@ -30,6 +30,40 @@ func wrapMiddleware(m fiber.Handler) middlewareEntry {
 
 func middlewareIDsEqual(a fiber.Handler, b middlewareEntry) bool {
 	return reflect.ValueOf(a).Pointer() == b.id
+}
+
+type ErrorResponse struct {
+	Timestamp time.Time `json:"timestamp"`
+	Error     string    `json:"error"`
+}
+
+func customErrorHandler(c *fiber.Ctx, err error) error {
+	errResp := ErrorResponse{
+		Timestamp: time.Now(),
+		Error:     err.Error(),
+	}
+	log.Error().Msg(err.Error())
+	return c.Status(fiber.StatusInternalServerError).JSON(errResp)
+}
+
+func matchRoute(pattern, path string) (bool, map[string]string) {
+	patternParts := strings.Split(strings.Trim(pattern, "/"), "/")
+	pathParts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(patternParts) != len(pathParts) {
+		return false, nil
+	}
+	params := map[string]string{}
+	for i := 0; i < len(patternParts); i++ {
+		pp := patternParts[i]
+		ap := pathParts[i]
+		if strings.HasPrefix(pp, ":") {
+			key := pp[1:]
+			params[key] = ap
+		} else if pp != ap {
+			return false, nil
+		}
+	}
+	return true, params
 }
 
 type Route struct {
@@ -82,6 +116,11 @@ func compressData(c *fiber.Ctx, data []byte) ([]byte, error) {
 	return data, nil
 }
 
+type methodRoutes struct {
+	exact  map[string]*Route
+	params []*Route
+}
+
 type Static struct {
 	Prefix           string `json:"prefix"`
 	Directory        string `json:"directory"`
@@ -95,10 +134,20 @@ type staticCacheEntry struct {
 	timestamp time.Time
 }
 
+const staticCacheTTL = 5 * time.Minute
+
+type StaticConfig struct {
+	Compress         bool
+	ByteRange        bool
+	CacheControl     string
+	DirectoryListing bool
+	CompressionLevel int
+}
+
 type Router struct {
 	app               *fiber.App
 	lock              sync.RWMutex
-	routes            map[string]map[string]*Route
+	routes            map[string]*methodRoutes
 	staticRoutes      []Static
 	GlobalMiddlewares []middlewareEntry
 	NotFoundHandler   fiber.Handler
@@ -106,15 +155,21 @@ type Router struct {
 	staticCacheLock   sync.RWMutex
 }
 
-const staticCacheTTL = 5 * time.Minute
-
 func New(app *fiber.App) *Router {
 	dr := &Router{
 		app:               app,
-		routes:            make(map[string]map[string]*Route),
+		routes:            make(map[string]*methodRoutes),
 		staticCache:       make(map[string]staticCacheEntry),
 		GlobalMiddlewares: []middlewareEntry{},
 	}
+
+	app.Use(func(c *fiber.Ctx) error {
+		err := c.Next()
+		if err != nil {
+			return customErrorHandler(c, err)
+		}
+		return nil
+	})
 	app.All("/*", dr.dispatch)
 	return dr
 }
@@ -143,7 +198,7 @@ func (dr *Router) Use(mw ...fiber.Handler) {
 	for _, m := range mw {
 		dr.GlobalMiddlewares = append(dr.GlobalMiddlewares, wrapMiddleware(m))
 	}
-	log.Printf("info msg=\"Added global middleware\" count=%d", len(mw))
+	log.Info().Int("count", len(mw)).Msg("Added global middleware")
 }
 
 func (dr *Router) dispatch(c *fiber.Ctx) error {
@@ -151,9 +206,16 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 	defer dr.lock.RUnlock()
 	method := c.Method()
 	path := c.Path()
-	if methodRoutes, ok := dr.routes[method]; ok {
-		if route, exists := methodRoutes[path]; exists {
+
+	if mr, ok := dr.routes[method]; ok {
+		if route, exists := mr.exact[path]; exists {
 			return route.Serve(c, dr.GlobalMiddlewares)
+		}
+		for _, route := range mr.params {
+			if matched, params := matchRoute(route.Path, path); matched {
+				c.Locals("params", params)
+				return route.Serve(c, dr.GlobalMiddlewares)
+			}
 		}
 	}
 	for _, sr := range dr.staticRoutes {
@@ -163,12 +225,12 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 			filePath := filepath.Join(sr.Directory, cleanRelative)
 			absDir, err := filepath.Abs(sr.Directory)
 			if err != nil {
-				log.Printf("error msg=\"Could not resolve absolute directory\" directory=%s error=%v", sr.Directory, err)
+				log.Error().Err(err).Msg("Could not resolve absolute directory")
 				return c.Status(500).SendString("Internal Server Error")
 			}
 			absFile, err := filepath.Abs(filePath)
 			if err != nil || !strings.HasPrefix(absFile, absDir) {
-				log.Printf("warn msg=\"Attempted directory traversal\" file=%s", filePath)
+				log.Warn().Err(err).Msgf("Attempted directory traversal: %s", filePath)
 				return c.Status(403).SendString("Forbidden")
 			}
 			info, err := os.Stat(filePath)
@@ -176,7 +238,7 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 				if sr.DirectoryListing {
 					entries, err := os.ReadDir(filePath)
 					if err != nil {
-						log.Printf("error msg=\"Failed to read directory\" file=%s error=%v", filePath, err)
+						log.Error().Err(err).Msgf("Failed to read directory: %s", filePath)
 						return c.Status(500).SendString("Error reading directory")
 					}
 					var builder strings.Builder
@@ -209,11 +271,11 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 				dr.staticCacheLock.RUnlock()
 				if found && time.Since(entry.timestamp) < staticCacheTTL {
 					data = entry.data
-					log.Printf("info msg=\"Static cache hit\" file=%s", filePath)
+					log.Info().Str("file", filePath).Msg("Static cache hit")
 				} else {
 					d, err := os.ReadFile(filePath)
 					if err != nil {
-						log.Printf("error msg=\"Error reading file\" file=%s error=%v", filePath, err)
+						log.Error().Err(err).Msgf("Failed to read file: %s", filePath)
 						return c.Status(500).SendString("Error reading file")
 					}
 					data = d
@@ -223,7 +285,7 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 				}
 				compData, err := compressData(c, data)
 				if err != nil {
-					log.Printf("error msg=\"Compression error\" file=%s error=%v", filePath, err)
+					log.Error().Err(err).Msgf("Failed to compress file: %s", filePath)
 					return c.Status(500).SendString("Compression error")
 				}
 				return c.Send(compData)
@@ -241,73 +303,114 @@ func (dr *Router) AddRoute(method, path string, handler fiber.Handler, middlewar
 	defer dr.lock.Unlock()
 	method = strings.ToUpper(method)
 	if dr.routes[method] == nil {
-		dr.routes[method] = make(map[string]*Route)
+		dr.routes[method] = &methodRoutes{
+			exact:  make(map[string]*Route),
+			params: []*Route{},
+		}
 	}
 	var mwEntries []middlewareEntry
 	for _, m := range middlewares {
 		mwEntries = append(mwEntries, wrapMiddleware(m))
 	}
-	dr.routes[method][path] = &Route{
+	route := &Route{
 		Method:      method,
 		Path:        path,
 		Handler:     handler,
 		Middlewares: mwEntries,
 	}
-	log.Printf("info msg=\"Added dynamic route\" method=%s path=%s", method, path)
+	if strings.Contains(path, ":") {
+		dr.routes[method].params = append(dr.routes[method].params, route)
+	} else {
+		dr.routes[method].exact[path] = route
+	}
+	log.Info().Str("method", method).Str("path", path).Msg("Added dynamic route")
 }
 
 func (dr *Router) UpdateRoute(method, path string, newHandler fiber.Handler) {
 	dr.lock.Lock()
 	defer dr.lock.Unlock()
 	method = strings.ToUpper(method)
-	if methodRoutes, ok := dr.routes[method]; ok {
-		if route, exists := methodRoutes[path]; exists {
+	if mr, ok := dr.routes[method]; ok {
+		if route, exists := mr.exact[path]; exists {
 			route.Handler = newHandler
-			log.Printf("info msg=\"Updated dynamic route handler\" method=%s path=%s", method, path)
+			log.Info().Str("method", method).Str("path", path).Msg("Updated dynamic route handler")
 			return
 		}
+		for _, route := range mr.params {
+			if route.Path == path {
+				route.Handler = newHandler
+				log.Info().Str("method", method).Str("path", path).Msg("Updated dynamic route handler")
+				return
+			}
+		}
 	}
-	log.Printf("warn msg=\"Route not found for update\" method=%s path=%s", method, path)
+	log.Warn().Str("method", method).Str("path", path).Msg("Route not found for update")
 }
 
 func (dr *Router) RenameRoute(method, oldPath, newPath string) {
 	dr.lock.Lock()
 	defer dr.lock.Unlock()
 	method = strings.ToUpper(method)
-	if methodRoutes, ok := dr.routes[method]; ok {
-		if route, exists := methodRoutes[oldPath]; exists {
-			delete(methodRoutes, oldPath)
+	if mr, ok := dr.routes[method]; ok {
+		if route, exists := mr.exact[oldPath]; exists {
+			delete(mr.exact, oldPath)
 			route.Path = newPath
-			methodRoutes[newPath] = route
-			log.Printf("info msg=\"Renamed route\" oldPath=%s newPath=%s method=%s", oldPath, newPath, method)
+			if strings.Contains(newPath, ":") {
+				mr.params = append(mr.params, route)
+			} else {
+				mr.exact[newPath] = route
+			}
+			log.Info().Str("method", method).Str("oldPath", oldPath).Str("newPath", newPath).Msg("Renamed route")
 			return
 		}
+		for i, route := range mr.params {
+			if route.Path == oldPath {
+				mr.params = append(mr.params[:i], mr.params[i+1:]...)
+				route.Path = newPath
+				if strings.Contains(newPath, ":") {
+					mr.params = append(mr.params, route)
+				} else {
+					mr.exact[newPath] = route
+				}
+				log.Info().Str("method", method).Str("oldPath", oldPath).Str("newPath", newPath).Msg("Renamed route")
+				return
+			}
+		}
 	}
-	log.Printf("warn msg=\"Route not found for rename\" method=%s oldPath=%s", method, oldPath)
+	log.Warn().Str("method", method).Str("oldPath", oldPath).Str("newPath", newPath).Msg("Route not found for rename")
 }
 
 func (dr *Router) AddMiddleware(method, path string, middlewares ...fiber.Handler) {
 	dr.lock.Lock()
 	defer dr.lock.Unlock()
 	method = strings.ToUpper(method)
-	if methodRoutes, ok := dr.routes[method]; ok {
-		if route, exists := methodRoutes[path]; exists {
+	if mr, ok := dr.routes[method]; ok {
+		if route, exists := mr.exact[path]; exists {
 			for _, m := range middlewares {
 				route.Middlewares = append(route.Middlewares, wrapMiddleware(m))
 			}
-			log.Printf("info msg=\"Added middleware to route\" method=%s path=%s count=%d", method, path, len(middlewares))
+			log.Info().Str("method", method).Str("path", path).Int("count", len(middlewares)).Msg("Added middleware to route")
 			return
 		}
+		for _, route := range mr.params {
+			if route.Path == path {
+				for _, m := range middlewares {
+					route.Middlewares = append(route.Middlewares, wrapMiddleware(m))
+				}
+				log.Info().Str("method", method).Str("path", path).Int("count", len(middlewares)).Msg("Added middleware to route")
+				return
+			}
+		}
 	}
-	log.Printf("warn msg=\"Route not found for adding middleware\" method=%s path=%s", method, path)
+	log.Warn().Str("method", method).Str("path", path).Int("count", len(middlewares)).Msg("Route not found for adding middleware")
 }
 
 func (dr *Router) RemoveMiddleware(method, path string, middlewares ...fiber.Handler) {
 	dr.lock.Lock()
 	defer dr.lock.Unlock()
 	method = strings.ToUpper(method)
-	if methodRoutes, ok := dr.routes[method]; ok {
-		if route, exists := methodRoutes[path]; exists {
+	if mr, ok := dr.routes[method]; ok {
+		removeFromRoute := func(route *Route) {
 			newChain := make([]middlewareEntry, 0, len(route.Middlewares))
 			for _, existing := range route.Middlewares {
 				shouldRemove := false
@@ -322,25 +425,42 @@ func (dr *Router) RemoveMiddleware(method, path string, middlewares ...fiber.Han
 				}
 			}
 			route.Middlewares = newChain
-			log.Printf("info msg=\"Removed middleware from route\" method=%s path=%s", method, path)
+		}
+		if route, exists := mr.exact[path]; exists {
+			removeFromRoute(route)
+			log.Info().Str("method", method).Str("path", path).Int("count", len(middlewares)).Msg("Removed middleware from route")
 			return
 		}
+		for _, route := range mr.params {
+			if route.Path == path {
+				removeFromRoute(route)
+				log.Info().Str("method", method).Str("path", path).Int("count", len(middlewares)).Msg("Removed middleware from route")
+				return
+			}
+		}
 	}
-	log.Printf("warn msg=\"Route not found for removing middleware\" method=%s path=%s", method, path)
+	log.Warn().Str("method", method).Str("path", path).Int("count", len(middlewares)).Msg("Route not found for removing middleware")
 }
 
 func (dr *Router) SetRenderer(method, path string, renderer fiber.Views) {
 	dr.lock.Lock()
 	defer dr.lock.Unlock()
 	method = strings.ToUpper(method)
-	if methodRoutes, ok := dr.routes[method]; ok {
-		if route, exists := methodRoutes[path]; exists {
+	if mr, ok := dr.routes[method]; ok {
+		if route, exists := mr.exact[path]; exists {
 			route.Renderer = renderer
-			log.Printf("info msg=\"Set custom renderer for route\" method=%s path=%s", method, path)
+			log.Info().Str("method", method).Str("path", path).Msg("Set custom renderer for route")
 			return
 		}
+		for _, route := range mr.params {
+			if route.Path == path {
+				route.Renderer = renderer
+				log.Info().Str("method", method).Str("path", path).Msg("Set custom renderer for route")
+				return
+			}
+		}
 	}
-	log.Printf("warn msg=\"Route not found for setting renderer\" method=%s path=%s", method, path)
+	log.Warn().Str("method", method).Str("path", path).Msg("Route not found for setting renderer")
 }
 
 func (dr *Router) Static(prefix, directory string, cfg ...StaticConfig) {
@@ -359,37 +479,47 @@ func (dr *Router) Static(prefix, directory string, cfg ...StaticConfig) {
 		DirectoryListing: sc.DirectoryListing,
 		CompressionLevel: sc.CompressionLevel,
 	})
-	log.Printf("info msg=\"Added static route\" prefix=%s directory=%s", prefix, directory)
+	log.Info().Str("prefix", prefix).Str("directory", directory).Msg("Added static route")
 }
 
 func (dr *Router) RemoveRoute(method, path string) {
 	dr.lock.Lock()
 	defer dr.lock.Unlock()
 	method = strings.ToUpper(method)
-	if methodRoutes, ok := dr.routes[method]; ok {
-		if _, exists := methodRoutes[path]; exists {
-			delete(methodRoutes, path)
-			log.Printf("info msg=\"Removed dynamic route\" method=%s path=%s", method, path)
+	if mr, ok := dr.routes[method]; ok {
+		if _, exists := mr.exact[path]; exists {
+			delete(mr.exact, path)
+			log.Info().Str("method", method).Str("path", path).Msg("Removed dynamic route")
 			return
 		}
+		for i, route := range mr.params {
+			if route.Path == path {
+				mr.params = append(mr.params[:i], mr.params[i+1:]...)
+				log.Info().Str("method", method).Str("path", path).Msg("Removed dynamic route")
+				return
+			}
+		}
 	}
-	log.Printf("warn msg=\"Route not found for removal\" method=%s path=%s", method, path)
+	log.Warn().Str("method", method).Str("path", path).Msg("Route not found for removal")
 }
 
 func (dr *Router) SetNotFoundHandler(handler fiber.Handler) {
 	dr.lock.Lock()
 	defer dr.lock.Unlock()
 	dr.NotFoundHandler = handler
-	log.Printf("info msg=\"Custom NotFoundHandler set\"")
+	log.Info().Msg("Set custom NotFoundHandler")
 }
 
 func (dr *Router) ListRoutes() []string {
 	dr.lock.RLock()
 	defer dr.lock.RUnlock()
 	var routesList []string
-	for method, routes := range dr.routes {
-		for path := range routes {
+	for method, mr := range dr.routes {
+		for path := range mr.exact {
 			routesList = append(routesList, method+" "+path)
+		}
+		for _, route := range mr.params {
+			routesList = append(routesList, method+" "+route.Path)
 		}
 	}
 	return routesList
@@ -399,15 +529,12 @@ func (dr *Router) InvalidateStaticCache(file string) {
 	dr.staticCacheLock.Lock()
 	defer dr.staticCacheLock.Unlock()
 	delete(dr.staticCache, file)
-	log.Printf("info msg=\"Invalidated static cache\" file=%s", file)
+	log.Info().Str("file", file).Msg("Invalidated static cache")
 }
 
-type StaticConfig struct {
-	Compress         bool
-	ByteRange        bool
-	CacheControl     string
-	DirectoryListing bool
-	CompressionLevel int
+func (dr *Router) Shutdown() error {
+	log.Info().Msg("Initiating graceful shutdown")
+	return dr.app.Shutdown()
 }
 
 type GroupRoute struct {
@@ -502,7 +629,7 @@ func (g *Group) ChangePrefix(newPrefix string) {
 		g.router.RenameRoute(gr.method, oldEffective, newEffective)
 		gr.effectivePath = newEffective
 	}
-	log.Printf("info msg=\"Group prefix changed\" oldPrefix=%s newPrefix=%s", oldPrefix, newPrefix)
+	log.Info().Str("oldPrefix", oldPrefix).Str("newPrefix", newPrefix).Msg("Group prefix changed")
 }
 
 func (g *Group) UpdateMiddlewares(newMW []fiber.Handler) {
@@ -522,7 +649,7 @@ func (g *Group) UpdateMiddlewares(newMW []fiber.Handler) {
 		}
 		g.router.AddRoute(gr.method, gr.effectivePath, gr.handler, combinedMW...)
 	}
-	log.Printf("info msg=\"Group middlewares updated\" groupPrefix=%s", g.prefix)
+	log.Info().Str("groupPrefix", g.prefix).Msg("Group middlewares updated")
 }
 
 func (g *Group) AddMiddleware(mw ...fiber.Handler) {
@@ -556,11 +683,11 @@ func (g *Group) RemoveRoute(relPath string) {
 		if gr.relPath == relPath {
 			g.router.RemoveRoute(gr.method, gr.effectivePath)
 			g.routes = append(g.routes[:i], g.routes[i+1:]...)
-			log.Printf("info msg=\"Removed group route\" method=%s relPath=%s", gr.method, relPath)
+			log.Info().Str("groupPrefix", g.prefix).Str("relPath", relPath).Msg("Group route removed")
 			return
 		}
 	}
-	log.Printf("warn msg=\"Group route not found for removal\" relPath=%s", relPath)
+	log.Warn().Str("relPath", relPath).Msg("Group route not found for removal")
 }
 
 func (dr *Router) Group(prefix string, m ...fiber.Handler) *Group {

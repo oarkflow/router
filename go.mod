@@ -5,6 +5,7 @@ go 1.24.0
 require (
 	github.com/gofiber/fiber/v2 v2.52.6
 	github.com/oarkflow/json v0.0.22
+	github.com/oarkflow/log v1.0.79
 )
 
 require (
