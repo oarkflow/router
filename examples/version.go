@@ -110,7 +110,6 @@ func formatDiff(diffs []diffmatchpatch.Diff) string {
 // base is the baseline (last committed version),
 // v1 is the merged result so far, and v2 is the new candidate.
 // Returns the merged result and a conflict indicator.
-// If both v1 and v2 differ from base and from each other, then we treat it as a conflict.
 func threeWayMerge(base, v1, v2 string) (string, bool) {
 	if v1 == v2 {
 		return v1, false
@@ -123,6 +122,29 @@ func threeWayMerge(base, v1, v2 string) (string, bool) {
 	}
 	// Conflict: both v1 and v2 have changes that differ.
 	return "", true
+}
+
+// --- Deployment Functionality ---
+
+// deployVersion writes each file from the version into the "Prod" directory.
+// It removes the "configs/" prefix from the file path and replicates the directory structure.
+func deployVersion(ver VersionGroup) error {
+	for srcPath, fileVersion := range ver.Files {
+		// Remove "configs/" prefix if present.
+		relPath := strings.TrimPrefix(srcPath, "configs/")
+		destPath := filepath.Join("Prod", relPath)
+		// Create the target directory if it doesn't exist.
+		destDir := filepath.Dir(destPath)
+		if err := os.MkdirAll(destDir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %v", destDir, err)
+		}
+		// Write the file content.
+		if err := os.WriteFile(destPath, []byte(fileVersion.Content), 0644); err != nil {
+			return fmt.Errorf("failed to write file %s: %v", destPath, err)
+		}
+		log.Printf("Deployed %s", destPath)
+	}
+	return nil
 }
 
 // --- File Watching ---
@@ -211,7 +233,6 @@ func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) C
 
 // MergeCommits merges all pending commits into a new version.
 // It iterates over each file modified by any commit and attempts a three-way merge.
-// The merge is based on the baseline (committedFiles) and the candidate versions from the commits.
 // If any file cannot be merged without conflict, an error is returned.
 func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 	vm.Lock()
@@ -279,7 +300,6 @@ func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 }
 
 // MergeSelectedCommits works like MergeCommits but only merges commits whose IDs are provided.
-// Commits not merged remain pending.
 func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (VersionGroup, error) {
 	vm.Lock()
 	defer vm.Unlock()
@@ -367,7 +387,7 @@ func (vm *VersionManager) AbortMerge() {
 	log.Println("Merge aborted. No changes applied.")
 }
 
-// GetDiff returns a diff between the latest stored file content and newContent.
+// GetDiff returns a diff between the stored latest file content and newContent.
 func (vm *VersionManager) GetDiff(path, newContent string) string {
 	vm.Lock()
 	defer vm.Unlock()
@@ -396,7 +416,7 @@ func watchFiles(paths []string) {
 			if err != nil {
 				return err
 			}
-			// Skip directories or files with a tilde suffix (backup files).
+			// Skip backup files (those ending with "~").
 			if strings.HasSuffix(info.Name(), "~") {
 				return nil
 			}
@@ -418,7 +438,7 @@ func watchFiles(paths []string) {
 			if !ok {
 				return
 			}
-			// Skip events for files that look like temporary/backup files.
+			// Skip events for temporary files.
 			if strings.HasSuffix(event.Name, "~") {
 				continue
 			}
@@ -553,6 +573,11 @@ func handleSwitchVersion(w http.ResponseWriter, r *http.Request) {
 	}
 	if selected == nil {
 		http.Error(w, "Version not found", http.StatusNotFound)
+		return
+	}
+	// Deploy the selected version by writing files to the "Prod" directory.
+	if err := deployVersion(*selected); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to deploy version: %v", err), http.StatusInternalServerError)
 		return
 	}
 	versionManager.deployedVersion = selected
