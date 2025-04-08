@@ -1,11 +1,11 @@
 module github.com/oarkflow/router
 
-go 1.24.0
+go 1.24.2
 
 require (
 	github.com/gofiber/fiber/v2 v2.52.6
-	github.com/oarkflow/json v0.0.22
-	github.com/oarkflow/log v1.0.79
+	github.com/oarkflow/json v0.0.24
+	github.com/oarkflow/log v1.0.82
 )
 
 require (
@@ -15,6 +15,7 @@ require (
 	github.com/gofiber/utils v1.1.0 // indirect
 	github.com/oarkflow/date v0.0.4 // indirect
 	github.com/oarkflow/expr v0.0.11 // indirect
+	github.com/oarkflow/xid v1.2.5 // indirect
 )
 
 require (
