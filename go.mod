@@ -10,12 +10,14 @@ require (
 
 require (
 	github.com/brianvoe/gofakeit/v6 v6.28.0 // indirect
+	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/goccy/go-reflect v1.2.0 // indirect
 	github.com/gofiber/template v1.8.3 // indirect
 	github.com/gofiber/utils v1.1.0 // indirect
 	github.com/oarkflow/date v0.0.4 // indirect
 	github.com/oarkflow/expr v0.0.11 // indirect
 	github.com/oarkflow/xid v1.2.5 // indirect
+	github.com/sergi/go-diff v1.3.1 // indirect
 )
 
 require (
@@ -30,5 +32,5 @@ require (
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasthttp v1.51.0 // indirect
 	github.com/valyala/tcplisten v1.0.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
+	golang.org/x/sys v0.32.0 // indirect
 )
