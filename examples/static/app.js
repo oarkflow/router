@@ -20,6 +20,7 @@ document.addEventListener("DOMContentLoaded", function () {
         prodSection.classList.remove("hidden");
         devSection.classList.add("hidden");
         loadVersions();
+        loadDeployedVersion();
     });
 
     // Load file changes for commit creation.
@@ -125,47 +126,43 @@ document.addEventListener("DOMContentLoaded", function () {
                            </div>`;
                 });
                 document.getElementById("versionsList").innerHTML = html || "<p>No versions created.</p>";
-                // Auto-load the most recent version as deployed
-                if (versions.length > 0) {
-                    loadDeployedVersion(versions[versions.length - 1].id);
-                } else {
-                    document.getElementById("deployedVersion").innerHTML = "<p>No version deployed yet.</p>";
-                }
+                // Removed auto-deploy. Instruct user to select a version.
+                document.getElementById("deployedVersion").innerHTML = "<p>Please select a version to deploy.</p>";
             });
     }
 
-    // Global function to load and display the deployed version.
-    function loadDeployedVersion(versionID) {
-        fetch("/api/versions")
-            .then(response => response.json())
-            .then(versions => {
-                // Find the version matching versionID.
-                const ver = versions.find(v => v.id == versionID);
-                let html = "";
-                if (ver) {
-                    let filesHTML = "";
-                    for (let file in ver.files) {
-                        filesHTML += `<div class="mb-2 border rounded p-2">
-                                <strong>File: ${file}</strong>
-                                <pre class="bg-gray-50 p-2 rounded text-sm overflow-x-auto">${ver.files[file].content}</pre>
-                             </div>`;
-                    }
-                    html += `<div>
-                                <h3 class="text-xl font-bold">Deployed Version ${ver.id} ${ver.tag ? "- " + ver.tag : ""}</h3>
-                                <p><strong>Commit Message: </strong>${ver.commitMessage}</p>
-                                ${filesHTML}
-                             </div>`;
-                } else {
-                    html = "<p>Selected version not found.</p>";
+    // Modified loadDeployedVersion to fetch the deployed version.
+    function loadDeployedVersion() {
+        fetch("/api/deployedVersion")
+            .then(response => {
+                if (!response.ok) {
+                    document.getElementById("deployedVersion").innerHTML = "<p>No version deployed.</p>";
+                    return null;
                 }
-                document.getElementById("deployedVersion").innerHTML = html;
-            });
+                return response.json();
+            })
+            .then(ver => {
+                if (!ver) return;
+                let filesHTML = "";
+                for (let file in ver.files) {
+                    filesHTML += `<div class="mb-2 border rounded p-2">
+                            <strong>File: ${file}</strong>
+                            <pre class="bg-gray-50 p-2 rounded text-sm overflow-x-auto">${ver.files[file].content}</pre>
+                         </div>`;
+                }
+                document.getElementById("deployedVersion").innerHTML = `<div>
+                            <h3 class="text-xl font-bold">Deployed Version ${ver.id} ${ver.tag ? "- " + ver.tag : ""}</h3>
+                            <p><strong>Commit Message: </strong>${ver.commitMessage}</p>
+                            ${filesHTML}
+                         </div>`;
+            })
+            .catch(err => console.error(err));
     }
 
     // Global function to respond to version switch.
     window.switchVersion = function (versionID) {
         console.log("Switched to version " + versionID);
-        loadDeployedVersion(versionID);
+        loadDeployedVersion();
     };
 
     // Create a commit.
@@ -237,7 +234,7 @@ document.addEventListener("DOMContentLoaded", function () {
             });
     });
 
-    // Switch Version button event.
+    // Update Switch Version button event handler.
     switchVersionBtn.addEventListener("click", function () {
         const radios = document.getElementsByName("versionRadio");
         let selected = null;
@@ -248,7 +245,25 @@ document.addEventListener("DOMContentLoaded", function () {
             }
         }
         if (selected) {
-            loadDeployedVersion(selected);
+            const payload = { version_id: parseInt(selected) };
+            fetch("/api/version/switch", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            })
+                .then(response => {
+                    if (!response.ok) {
+                        return response.text().then(error => { throw new Error(error); });
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    alert(`Switched to version ${data.id}`);
+                    loadDeployedVersion();
+                })
+                .catch(err => {
+                    alert("Switch version error: " + err.message);
+                });
         } else {
             alert("Please select a version.");
         }

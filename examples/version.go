@@ -59,18 +59,20 @@ type VersionManager struct {
 	nextVerID int
 
 	// New: Baseline for committed files
-	committedFiles map[string]string
+	committedFiles  map[string]string
+	deployedVersion *VersionGroup // added field to store deployed version
 }
 
 func NewVersionManager() *VersionManager {
 	return &VersionManager{
-		latestFiles:    make(map[string]string),
-		fileVersions:   make(map[string][]FileVersion),
-		commits:        []Commit{},
-		versions:       []VersionGroup{},
-		committedFiles: make(map[string]string),
-		nextCommitID:   1,
-		nextVerID:      1,
+		latestFiles:     make(map[string]string),
+		fileVersions:    make(map[string][]FileVersion),
+		commits:         []Commit{},
+		versions:        []VersionGroup{},
+		committedFiles:  make(map[string]string),
+		deployedVersion: nil, // initialize deployedVersion
+		nextCommitID:    1,
+		nextVerID:       1,
 	}
 }
 
@@ -184,26 +186,55 @@ func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) C
 	return commit
 }
 
-// MergeCommits merges all pending commits into a new version (release).
-// For each file, if multiple commits modified it, all changes must be identical or a conflict is raised.
+// Modified MergeCommits to merge file changes like git.
 func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 	vm.Lock()
 	defer vm.Unlock()
 
-	mergedFiles := make(map[string]FileVersion)
 	mergedMsg := []string{}
-	conflicts := []string{}
+	fileCommits := make(map[string][]FileVersion)
+	var conflicts []string
+	dmp := diffmatchpatch.New()
 
+	// Gather file changes from all commits.
 	for _, commit := range vm.commits {
 		mergedMsg = append(mergedMsg, fmt.Sprintf("Commit %d: %s", commit.ID, commit.Message))
 		for file, version := range commit.Files {
-			if existing, ok := mergedFiles[file]; ok {
-				if existing.Content != version.Content {
+			fileCommits[file] = append(fileCommits[file], version)
+		}
+	}
+
+	mergedFiles := make(map[string]FileVersion)
+	// For each file, merge changes sequentially from baseline.
+	for file, changes := range fileCommits {
+		baseline := ""
+		if b, ok := vm.committedFiles[file]; ok {
+			baseline = strings.TrimSpace(b)
+		}
+		merged := baseline
+		for _, candidate := range changes {
+			// Compute patch from current merged state to candidate content.
+			patches := dmp.PatchMake(merged, strings.TrimSpace(candidate.Content))
+			newMerged, results := dmp.PatchApply(patches, merged)
+			for _, applied := range results {
+				if !applied {
 					conflicts = append(conflicts, file)
+					break
 				}
-			} else {
-				mergedFiles[file] = version
 			}
+			if len(conflicts) > 0 {
+				break
+			}
+			merged = newMerged
+		}
+		if len(conflicts) > 0 {
+			break
+		}
+		finalDiff := formatDiff(dmp.DiffMain(baseline, merged, false))
+		mergedFiles[file] = FileVersion{
+			Timestamp: time.Now(),
+			Content:   merged,
+			Diff:      finalDiff,
 		}
 	}
 	if len(conflicts) > 0 {
@@ -219,20 +250,20 @@ func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 	}
 	vm.versions = append(vm.versions, mergedVersion)
 	vm.nextVerID++
-
-	// Clear pending commits after a successful merge.
-	vm.commits = []Commit{}
+	vm.commits = []Commit{} // Clear pending commits after a successful merge.
 	log.Printf("Created version %d with tag '%s'", mergedVersion.ID, tag)
 	return mergedVersion, nil
 }
 
-// MergeSelectedCommits merges only the selected commits.
+// Modified MergeSelectedCommits to merge file changes like git.
 func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (VersionGroup, error) {
 	vm.Lock()
 	defer vm.Unlock()
-	mergedFiles := make(map[string]FileVersion)
+
 	mergedMsg := []string{}
-	conflicts := []string{}
+	fileCommits := make(map[string][]FileVersion)
+	var conflicts []string
+	dmp := diffmatchpatch.New()
 
 	selectedMap := make(map[int]bool)
 	for _, id := range commitIDs {
@@ -240,25 +271,54 @@ func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (Ver
 	}
 
 	remainingCommits := []Commit{}
+	// Gather file changes from selected commits.
 	for _, commit := range vm.commits {
 		if selectedMap[commit.ID] {
 			mergedMsg = append(mergedMsg, fmt.Sprintf("Commit %d: %s", commit.ID, commit.Message))
 			for file, fv := range commit.Files {
-				if existing, ok := mergedFiles[file]; ok {
-					if existing.Content != fv.Content {
-						conflicts = append(conflicts, file)
-					}
-				} else {
-					mergedFiles[file] = fv
-				}
+				fileCommits[file] = append(fileCommits[file], fv)
 			}
 		} else {
 			remainingCommits = append(remainingCommits, commit)
 		}
 	}
+
+	mergedFiles := make(map[string]FileVersion)
+	for file, changes := range fileCommits {
+		baseline := ""
+		if b, ok := vm.committedFiles[file]; ok {
+			baseline = strings.TrimSpace(b)
+		}
+		merged := baseline
+		for _, candidate := range changes {
+			// Compute patch from current merged state to candidate content.
+			patches := dmp.PatchMake(merged, strings.TrimSpace(candidate.Content))
+			newMerged, results := dmp.PatchApply(patches, merged)
+			for _, applied := range results {
+				if !applied {
+					conflicts = append(conflicts, file)
+					break
+				}
+			}
+			if len(conflicts) > 0 {
+				break
+			}
+			merged = newMerged
+		}
+		if len(conflicts) > 0 {
+			break
+		}
+		finalDiff := formatDiff(dmp.DiffMain(baseline, merged, false))
+		mergedFiles[file] = FileVersion{
+			Timestamp: time.Now(),
+			Content:   merged,
+			Diff:      finalDiff,
+		}
+	}
 	if len(conflicts) > 0 {
 		return VersionGroup{}, fmt.Errorf("merge conflict in files: %s", strings.Join(conflicts, ", "))
 	}
+
 	mergedVersion := VersionGroup{
 		ID:            vm.nextVerID,
 		Tag:           tag,
@@ -268,8 +328,7 @@ func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (Ver
 	}
 	vm.versions = append(vm.versions, mergedVersion)
 	vm.nextVerID++
-	// Remove merged commits.
-	vm.commits = remainingCommits
+	vm.commits = remainingCommits // Remove merged commits.
 	log.Printf("Created version %d with tag '%s' merging commits: %v", mergedVersion.ID, tag, commitIDs)
 	return mergedVersion, nil
 }
@@ -433,6 +492,45 @@ func handleGetVersions(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(versionManager.versions)
 }
 
+// New handler to switch deployed version.
+type SwitchVersionPayload struct {
+	VersionID int `json:"version_id"`
+}
+
+func handleSwitchVersion(w http.ResponseWriter, r *http.Request) {
+	var payload SwitchVersionPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	versionManager.Lock()
+	defer versionManager.Unlock()
+	var selected *VersionGroup
+	for _, ver := range versionManager.versions {
+		if ver.ID == payload.VersionID {
+			selected = &ver
+			break
+		}
+	}
+	if selected == nil {
+		http.Error(w, "Version not found", http.StatusNotFound)
+		return
+	}
+	versionManager.deployedVersion = selected
+	log.Printf("Switched to deployed version %d", selected.ID)
+	json.NewEncoder(w).Encode(selected)
+}
+
+func handleDeployedVersion(w http.ResponseWriter, r *http.Request) {
+	versionManager.Lock()
+	defer versionManager.Unlock()
+	if versionManager.deployedVersion == nil {
+		http.Error(w, "No deployed version", http.StatusNotFound)
+		return
+	}
+	json.NewEncoder(w).Encode(versionManager.deployedVersion)
+}
+
 // Serve the main HTML page.
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "./static/index.html")
@@ -450,6 +548,9 @@ func main() {
 	http.HandleFunc("/api/version/mergeSelected", handleMergeSelectedCommits)
 	http.HandleFunc("/api/version/revert", handleRevertCommits)
 	http.HandleFunc("/api/versions", handleGetVersions)
+	// New endpoints for deployed version
+	http.HandleFunc("/api/version/switch", handleSwitchVersion)
+	http.HandleFunc("/api/deployedVersion", handleDeployedVersion)
 	http.HandleFunc("/", handleIndex)
 
 	fs := http.FileServer(http.Dir("./static"))
