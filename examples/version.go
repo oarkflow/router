@@ -148,33 +148,47 @@ func deployVersion(ver VersionGroup) error {
 }
 
 // --- Git Init Functionality ---
-// gitInit simulates "git init" by taking the current file snapshots
-// and using them to establish an initial baseline. It also creates an initial commit.
+// gitInit simulates "git init" by taking the current file snapshots,
+// computing diffs from an empty baseline, and creating an initial commit.
 func gitInit() error {
 	versionManager.Lock()
 	defer versionManager.Unlock()
 
-	// Iterate over the currently watched files and add them as baseline.
+	// Iterate over the currently watched files and add them with an empty baseline.
 	for file, content := range versionManager.latestFiles {
 		trimmed := strings.TrimSpace(content)
-		// Set the committed baseline if not already set.
 		if _, exists := versionManager.committedFiles[file]; !exists {
-			versionManager.committedFiles[file] = trimmed
-			// Also initialize the history with this content.
+			// Set empty baseline so diff shows full content as addition.
+			versionManager.committedFiles[file] = ""
+			// Initialize history with the current content.
 			versionManager.fileVersions[file] = []FileVersion{{Timestamp: time.Now(), Content: trimmed}}
-			log.Printf("Added '%s' to initial baseline.", file)
+			log.Printf("Added '%s' with empty baseline for initial diff.", file)
 		}
 	}
 
-	// Create an initial commit with all files.
+	// Create an initial commit with all files showing diffs from empty baseline.
 	initCommit := Commit{
 		ID:        versionManager.nextCommitID,
 		Timestamp: time.Now(),
 		Message:   "Initial commit",
 		Files:     make(map[string]FileVersion),
 	}
-	for file, content := range versionManager.committedFiles {
-		initCommit.Files[file] = FileVersion{Timestamp: time.Now(), Content: content}
+	dmp := diffmatchpatch.New()
+	for file, content := range versionManager.latestFiles {
+		trimmed := strings.TrimSpace(content)
+		baseline := ""
+		diffs := dmp.DiffMain(baseline, trimmed, false)
+		dmp.DiffCleanupSemantic(diffs)
+		diffText := formatDiff(diffs)
+		initCommit.Files[file] = FileVersion{
+			Timestamp: time.Now(),
+			Content:   trimmed,
+			Diff:      diffText,
+		}
+		// Update the committed baseline to the current content.
+		versionManager.committedFiles[file] = trimmed
+		// Reset history for this file.
+		versionManager.fileVersions[file] = []FileVersion{{Timestamp: time.Now(), Content: trimmed}}
 	}
 	versionManager.commits = append(versionManager.commits, initCommit)
 	versionManager.nextCommitID++
