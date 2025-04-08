@@ -147,6 +147,41 @@ func deployVersion(ver VersionGroup) error {
 	return nil
 }
 
+// --- Git Init Functionality ---
+// gitInit simulates "git init" by taking the current file snapshots
+// and using them to establish an initial baseline. It also creates an initial commit.
+func gitInit() error {
+	versionManager.Lock()
+	defer versionManager.Unlock()
+
+	// Iterate over the currently watched files and add them as baseline.
+	for file, content := range versionManager.latestFiles {
+		trimmed := strings.TrimSpace(content)
+		// Set the committed baseline if not already set.
+		if _, exists := versionManager.committedFiles[file]; !exists {
+			versionManager.committedFiles[file] = trimmed
+			// Also initialize the history with this content.
+			versionManager.fileVersions[file] = []FileVersion{{Timestamp: time.Now(), Content: trimmed}}
+			log.Printf("Added '%s' to initial baseline.", file)
+		}
+	}
+
+	// Create an initial commit with all files.
+	initCommit := Commit{
+		ID:        versionManager.nextCommitID,
+		Timestamp: time.Now(),
+		Message:   "Initial commit",
+		Files:     make(map[string]FileVersion),
+	}
+	for file, content := range versionManager.committedFiles {
+		initCommit.Files[file] = FileVersion{Timestamp: time.Now(), Content: content}
+	}
+	versionManager.commits = append(versionManager.commits, initCommit)
+	versionManager.nextCommitID++
+	log.Printf("Initialized repository with commit %d.", initCommit.ID)
+	return nil
+}
+
 // --- File Watching ---
 
 // UpdateFile is called by the watcher when a file is changed.
@@ -464,6 +499,15 @@ func watchFiles(paths []string) {
 
 // --- API Handlers ---
 
+// handleInit performs the initial setup (like "git init") by capturing the current state of files.
+func handleInit(w http.ResponseWriter, r *http.Request) {
+	if err := gitInit(); err != nil {
+		http.Error(w, fmt.Sprintf("Init failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Write([]byte("Repository initialized with current file states."))
+}
+
 // handleChanges returns file diffs from the watcher.
 func handleChanges(w http.ResponseWriter, r *http.Request) {
 	changes := versionManager.GetChanges()
@@ -606,6 +650,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 func main() {
 	go watchFiles(watchPaths)
 
+	http.HandleFunc("/api/init", handleInit) // New endpoint for "git init"-like behavior.
 	http.HandleFunc("/api/changes", handleChanges)
 	http.HandleFunc("/api/commit", handleCommit)
 	http.HandleFunc("/api/commits", handleGetCommits)
