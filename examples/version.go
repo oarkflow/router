@@ -341,6 +341,15 @@ func (vm *VersionManager) RevertPendingCommits() {
 	log.Println("Pending commits reverted.")
 }
 
+// Add new method to abort merge similar to "git merge --abort"
+func (vm *VersionManager) AbortMerge() {
+	vm.Lock()
+	defer vm.Unlock()
+	// Since merge functions are atomic,
+	// simply log that the merge has been aborted.
+	log.Println("Merge aborted. No changes applied.")
+}
+
 // GetDiff returns a diff between a stored file content and a new version.
 func (vm *VersionManager) GetDiff(path, newContent string) string {
 	vm.Lock()
@@ -485,6 +494,12 @@ func handleRevertCommits(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Pending commits reverted."))
 }
 
+// HTTP handler to abort the merge process.
+func handleAbortMerge(w http.ResponseWriter, r *http.Request) {
+	versionManager.AbortMerge()
+	w.Write([]byte("Merge aborted."))
+}
+
 // List created versions.
 func handleGetVersions(w http.ResponseWriter, r *http.Request) {
 	versionManager.Lock()
@@ -542,15 +557,14 @@ func main() {
 	http.HandleFunc("/api/changes", handleChanges)
 	http.HandleFunc("/api/commit", handleCommit)
 	http.HandleFunc("/api/commits", handleGetCommits)
-	// Existing merge-all endpoint remains.
 	http.HandleFunc("/api/version", handleCreateVersion)
-	// New handler for merging selected commits.
 	http.HandleFunc("/api/version/mergeSelected", handleMergeSelectedCommits)
 	http.HandleFunc("/api/version/revert", handleRevertCommits)
 	http.HandleFunc("/api/versions", handleGetVersions)
-	// New endpoints for deployed version
 	http.HandleFunc("/api/version/switch", handleSwitchVersion)
 	http.HandleFunc("/api/deployedVersion", handleDeployedVersion)
+	// NEW: Register abort merge endpoint.
+	http.HandleFunc("/api/merge/abort", handleAbortMerge)
 	http.HandleFunc("/", handleIndex)
 
 	fs := http.FileServer(http.Dir("./static"))
