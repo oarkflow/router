@@ -15,17 +15,19 @@ import (
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
-// Watch for changes in these directories/files.
+// --- Configuration & Data Structures ---
+
+// The watchPaths can be adjusted to point to your selected directory.
 var watchPaths = []string{"./configs"}
 
-// FileVersion now stores diff information as well.
+// FileVersion stores a file snapshot and its diff.
 type FileVersion struct {
 	Timestamp time.Time `json:"timestamp"`
 	Content   string    `json:"content"`
 	Diff      string    `json:"diff,omitempty"`
 }
 
-// Commit represents a single commit created in Developer Mode.
+// Commit represents an individual commit with a commit message and a set of file snapshots.
 type Commit struct {
 	ID        int                    `json:"id"`
 	Timestamp time.Time              `json:"timestamp"`
@@ -33,7 +35,7 @@ type Commit struct {
 	Files     map[string]FileVersion `json:"files"`
 }
 
-// VersionGroup represents a merged version (release) based on pending commits.
+// VersionGroup represents a merged (released) version that is the result of merging one or more commits.
 type VersionGroup struct {
 	ID            int                    `json:"id"`
 	Tag           string                 `json:"tag,omitempty"`
@@ -42,27 +44,21 @@ type VersionGroup struct {
 	Files         map[string]FileVersion `json:"files"`
 }
 
-// VersionManager manages file snapshots, pending commits, and created versions.
+// VersionManager manages file snapshots from the watcher, pending commits, and released versions.
+// It also holds a baseline of committed files and a pointer to the currently deployed version.
 type VersionManager struct {
 	sync.Mutex
-	// Latest snapshot per file (updated via file watcher).
-	latestFiles map[string]string
-	// History of file changes (not directly visible to end users).
-	fileVersions map[string][]FileVersion
-
-	// Pending commits created by developers.
-	commits      []Commit
-	nextCommitID int
-
-	// Merged versions (releases).
-	versions  []VersionGroup
-	nextVerID int
-
-	// New: Baseline for committed files
-	committedFiles  map[string]string
-	deployedVersion *VersionGroup // added field to store deployed version
+	latestFiles     map[string]string        // Latest snapshot per file (from the watcher)
+	fileVersions    map[string][]FileVersion // History of snapshots per file
+	commits         []Commit                 // Pending commits (created in Developer Mode)
+	nextCommitID    int
+	versions        []VersionGroup // Merged versions (releases)
+	nextVerID       int
+	committedFiles  map[string]string // Baseline contents of files after they were last committed
+	deployedVersion *VersionGroup     // Currently deployed version (if any)
 }
 
+// NewVersionManager creates and initializes a new VersionManager.
 func NewVersionManager() *VersionManager {
 	return &VersionManager{
 		latestFiles:     make(map[string]string),
@@ -70,7 +66,7 @@ func NewVersionManager() *VersionManager {
 		commits:         []Commit{},
 		versions:        []VersionGroup{},
 		committedFiles:  make(map[string]string),
-		deployedVersion: nil, // initialize deployedVersion
+		deployedVersion: nil,
 		nextCommitID:    1,
 		nextVerID:       1,
 	}
@@ -78,17 +74,9 @@ func NewVersionManager() *VersionManager {
 
 var versionManager = NewVersionManager()
 
-// UpdateFile is called by the file watcher when a file is modified.
-func (vm *VersionManager) UpdateFile(path, content string) {
-	vm.Lock()
-	defer vm.Unlock()
-	version := FileVersion{Timestamp: time.Now(), Content: content}
-	vm.latestFiles[path] = content
-	vm.fileVersions[path] = append(vm.fileVersions[path], version)
-	log.Printf("File updated: %s", path)
-}
+// --- Utility Functions ---
 
-// formatDiff produces a git-like diff string.
+// formatDiff converts a slice of diffs into a git-like diff string.
 func formatDiff(diffs []diffmatchpatch.Diff) string {
 	var result strings.Builder
 	for _, d := range diffs {
@@ -117,20 +105,33 @@ func formatDiff(diffs []diffmatchpatch.Diff) string {
 	return result.String()
 }
 
-// GetChanges compares the latest file snapshot against its last committed version.
+// --- File Watching & Snapshot Updating ---
+
+// UpdateFile is called by the file watcher when a file is modified.
+func (vm *VersionManager) UpdateFile(path, content string) {
+	vm.Lock()
+	defer vm.Unlock()
+	version := FileVersion{Timestamp: time.Now(), Content: content}
+	vm.latestFiles[path] = content
+	vm.fileVersions[path] = append(vm.fileVersions[path], version)
+	log.Printf("File updated: %s", path)
+}
+
+// --- Diff & Change Detection ---
+
+// GetChanges compares the latest snapshot against the committed baseline and returns a map of file diffs.
 func (vm *VersionManager) GetChanges() map[string]string {
 	vm.Lock()
 	defer vm.Unlock()
 	changes := make(map[string]string)
 	dmp := diffmatchpatch.New()
-	// For each file tracked, use the committed baseline if available.
 	for file, versions := range vm.fileVersions {
 		baseline := ""
 		if c, ok := vm.committedFiles[file]; ok {
 			baseline = strings.TrimSpace(c)
 		}
 		latest := strings.TrimSpace(versions[len(versions)-1].Content)
-		// Debug log to verify comparison values.
+		// Log comparison details for debugging.
 		log.Printf("Comparing file '%s': baseline='%s', latest='%s'", file, baseline, latest)
 		if latest == baseline {
 			continue
@@ -145,7 +146,11 @@ func (vm *VersionManager) GetChanges() map[string]string {
 	return changes
 }
 
-// CreateCommit creates a new commit in Developer Mode from a selection of files.
+// --- Developer Mode: Commit Creation ---
+
+// CreateCommit creates a new commit for the selected files.
+// For each file, it computes the diff relative to the committed baseline,
+// updates the baseline to the current state and resets the file history.
 func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) Commit {
 	vm.Lock()
 	defer vm.Unlock()
@@ -159,7 +164,6 @@ func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) C
 	}
 	for _, file := range selectedFiles {
 		if versions, exists := vm.fileVersions[file]; exists && len(versions) > 0 {
-			// Compute diff relative to last committed baseline.
 			baseline := ""
 			if c, ok := vm.committedFiles[file]; ok {
 				baseline = strings.TrimSpace(c)
@@ -174,9 +178,9 @@ func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) C
 				Diff:      diffText,
 			}
 			commit.Files[file] = fv
-			// Update committed baseline.
+			// Update baseline for this file.
 			vm.committedFiles[file] = current
-			// Reset fileVersions for this file to only contain the committed version.
+			// Reset the file history: only store the committed version.
 			vm.fileVersions[file] = []FileVersion{{Timestamp: time.Now(), Content: current}}
 		}
 	}
@@ -186,7 +190,12 @@ func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) C
 	return commit
 }
 
-// Modified MergeCommits to merge file changes like git.
+// --- Production Mode: Merging Commits into a Version ---
+
+// MergeCommits merges all pending commits sequentially.
+// For each file, the function applies changes one by one from a baseline,
+// detecting conflicts if a patch fails to apply. If any file has conflicting changes,
+// an error is returned. Otherwise, a new VersionGroup is created.
 func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 	vm.Lock()
 	defer vm.Unlock()
@@ -196,7 +205,7 @@ func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 	var conflicts []string
 	dmp := diffmatchpatch.New()
 
-	// Gather file changes from all commits.
+	// Gather file changes from all pending commits.
 	for _, commit := range vm.commits {
 		mergedMsg = append(mergedMsg, fmt.Sprintf("Commit %d: %s", commit.ID, commit.Message))
 		for file, version := range commit.Files {
@@ -205,7 +214,7 @@ func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 	}
 
 	mergedFiles := make(map[string]FileVersion)
-	// For each file, merge changes sequentially from baseline.
+	// For each file with changes, start from its baseline and apply each commit sequentially.
 	for file, changes := range fileCommits {
 		baseline := ""
 		if b, ok := vm.committedFiles[file]; ok {
@@ -213,9 +222,9 @@ func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 		}
 		merged := baseline
 		for _, candidate := range changes {
-			// Compute patch from current merged state to candidate content.
 			patches := dmp.PatchMake(merged, strings.TrimSpace(candidate.Content))
 			newMerged, results := dmp.PatchApply(patches, merged)
+			// If any patch could not be applied, register a conflict.
 			for _, applied := range results {
 				if !applied {
 					conflicts = append(conflicts, file)
@@ -250,12 +259,14 @@ func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 	}
 	vm.versions = append(vm.versions, mergedVersion)
 	vm.nextVerID++
-	vm.commits = []Commit{} // Clear pending commits after a successful merge.
+	// Clear pending commits upon a successful merge.
+	vm.commits = []Commit{}
 	log.Printf("Created version %d with tag '%s'", mergedVersion.ID, tag)
 	return mergedVersion, nil
 }
 
-// Modified MergeSelectedCommits to merge file changes like git.
+// MergeSelectedCommits merges only the commits whose IDs are provided.
+// Commits that are not merged remain pending.
 func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (VersionGroup, error) {
 	vm.Lock()
 	defer vm.Unlock()
@@ -269,8 +280,8 @@ func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (Ver
 	for _, id := range commitIDs {
 		selectedMap[id] = true
 	}
-
 	remainingCommits := []Commit{}
+
 	// Gather file changes from selected commits.
 	for _, commit := range vm.commits {
 		if selectedMap[commit.ID] {
@@ -291,7 +302,6 @@ func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (Ver
 		}
 		merged := baseline
 		for _, candidate := range changes {
-			// Compute patch from current merged state to candidate content.
 			patches := dmp.PatchMake(merged, strings.TrimSpace(candidate.Content))
 			newMerged, results := dmp.PatchApply(patches, merged)
 			for _, applied := range results {
@@ -328,12 +338,13 @@ func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (Ver
 	}
 	vm.versions = append(vm.versions, mergedVersion)
 	vm.nextVerID++
-	vm.commits = remainingCommits // Remove merged commits.
+	// Only remove the merged commits.
+	vm.commits = remainingCommits
 	log.Printf("Created version %d with tag '%s' merging commits: %v", mergedVersion.ID, tag, commitIDs)
 	return mergedVersion, nil
 }
 
-// RevertPendingCommits clears any pending commits.
+// RevertPendingCommits clears all pending commits.
 func (vm *VersionManager) RevertPendingCommits() {
 	vm.Lock()
 	defer vm.Unlock()
@@ -341,16 +352,14 @@ func (vm *VersionManager) RevertPendingCommits() {
 	log.Println("Pending commits reverted.")
 }
 
-// Add new method to abort merge similar to "git merge --abort"
+// AbortMerge is provided to simulate an abort (like git merge --abort).
 func (vm *VersionManager) AbortMerge() {
 	vm.Lock()
 	defer vm.Unlock()
-	// Since merge functions are atomic,
-	// simply log that the merge has been aborted.
 	log.Println("Merge aborted. No changes applied.")
 }
 
-// GetDiff returns a diff between a stored file content and a new version.
+// GetDiff returns a diff between the stored latest file content and the supplied new content.
 func (vm *VersionManager) GetDiff(path, newContent string) string {
 	vm.Lock()
 	defer vm.Unlock()
@@ -390,7 +399,7 @@ func watchFiles(paths []string) {
 		}
 	}
 
-	// Listen for events.
+	// Process file events.
 	for {
 		select {
 		case event, ok := <-watcher.Events:
@@ -404,7 +413,6 @@ func watchFiles(paths []string) {
 					continue
 				}
 				content := string(data)
-				// Compute diff (for logging) using the current snapshot.
 				diff := versionManager.GetDiff(event.Name, content)
 				log.Printf("Change on %s\nDiff:\n%s", event.Name, diff)
 				versionManager.UpdateFile(event.Name, content)
@@ -420,13 +428,13 @@ func watchFiles(paths []string) {
 
 // --- API Handlers ---
 
-// Returns diffs (changes) for files (used by Developer Mode).
+// handleChanges returns file diffs (changes) as seen by the file watcher.
 func handleChanges(w http.ResponseWriter, r *http.Request) {
 	changes := versionManager.GetChanges()
 	json.NewEncoder(w).Encode(changes)
 }
 
-// Create a new commit.
+// Commit creation API.
 type CommitPayload struct {
 	Message string   `json:"message"`
 	Files   []string `json:"files"`
@@ -449,7 +457,7 @@ func handleGetCommits(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(versionManager.commits)
 }
 
-// Merge pending commits into a version.
+// Merge all pending commits into a version.
 type VersionPayload struct {
 	Tag string `json:"tag"`
 }
@@ -488,26 +496,26 @@ func handleMergeSelectedCommits(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(ver)
 }
 
-// Revert (clear) pending commits.
+// Revert pending commits.
 func handleRevertCommits(w http.ResponseWriter, r *http.Request) {
 	versionManager.RevertPendingCommits()
 	w.Write([]byte("Pending commits reverted."))
 }
 
-// HTTP handler to abort the merge process.
+// Abort an ongoing merge.
 func handleAbortMerge(w http.ResponseWriter, r *http.Request) {
 	versionManager.AbortMerge()
 	w.Write([]byte("Merge aborted."))
 }
 
-// List created versions.
+// List all created versions.
 func handleGetVersions(w http.ResponseWriter, r *http.Request) {
 	versionManager.Lock()
 	defer versionManager.Unlock()
 	json.NewEncoder(w).Encode(versionManager.versions)
 }
 
-// New handler to switch deployed version.
+// Switch the deployed version.
 type SwitchVersionPayload struct {
 	VersionID int `json:"version_id"`
 }
@@ -536,6 +544,7 @@ func handleSwitchVersion(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(selected)
 }
 
+// Retrieve the deployed version.
 func handleDeployedVersion(w http.ResponseWriter, r *http.Request) {
 	versionManager.Lock()
 	defer versionManager.Unlock()
@@ -546,27 +555,30 @@ func handleDeployedVersion(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(versionManager.deployedVersion)
 }
 
-// Serve the main HTML page.
+// Serve the frontend HTML page.
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "./static/index.html")
 }
 
+// --- Main ---
+
 func main() {
 	go watchFiles(watchPaths)
 
+	// API endpoints.
 	http.HandleFunc("/api/changes", handleChanges)
 	http.HandleFunc("/api/commit", handleCommit)
 	http.HandleFunc("/api/commits", handleGetCommits)
 	http.HandleFunc("/api/version", handleCreateVersion)
 	http.HandleFunc("/api/version/mergeSelected", handleMergeSelectedCommits)
 	http.HandleFunc("/api/version/revert", handleRevertCommits)
+	http.HandleFunc("/api/merge/abort", handleAbortMerge)
 	http.HandleFunc("/api/versions", handleGetVersions)
 	http.HandleFunc("/api/version/switch", handleSwitchVersion)
 	http.HandleFunc("/api/deployedVersion", handleDeployedVersion)
-	// NEW: Register abort merge endpoint.
-	http.HandleFunc("/api/merge/abort", handleAbortMerge)
 	http.HandleFunc("/", handleIndex)
 
+	// Serve static files from ./static.
 	fs := http.FileServer(http.Dir("./static"))
 	http.Handle("/static/", http.StripPrefix("/static/", fs))
 
