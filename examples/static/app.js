@@ -96,24 +96,34 @@ document.addEventListener("DOMContentLoaded", function () {
 
     // Modified loadVersions: show versions as accordions with radio buttons.
     function loadVersions() {
-        fetch("/api/versions")
-            .then(response => response.json())
-            .then(versions => {
-                let html = "";
-                versions.forEach((ver, index) => {
-                    let filesHTML = "";
-                    for (let file in ver.files) {
-                        filesHTML += `<details class="ml-4 mb-2 border rounded">
+        // Fetch both all versions and deployed version.
+        Promise.all([
+            fetch("/api/versions").then(response => response.json()),
+            fetch("/api/deployedVersion").then(response => response.ok ? response.json() : null)
+        ]).then(([versions, deployedVersion]) => {
+            let deployedID = deployedVersion ? deployedVersion.id : null;
+            let html = "";
+            versions.forEach((ver, index) => {
+                let filesHTML = "";
+                for (let file in ver.files) {
+                    filesHTML += `<details class="ml-4 mb-2 border rounded">
                               <summary>File: ${file}</summary>
                               <div class="p-2">
                                   <p><strong>Content:</strong></p>
                                   <pre class="bg-gray-50 p-2 rounded text-sm overflow-x-auto">${ver.files[file].content}</pre>
                               </div>
                            </details>`;
+                }
+                // Mark version as selected if it matches the deployed version, otherwise use default (the first version if no deployed version)
+                let checked = "";
+                if (deployedID) {
+                    if (ver.id === deployedID) {
+                        checked = "checked";
                     }
-                    html += `<div class="mb-4 border rounded p-2">
+                }
+                html += `<div class="mb-4 border rounded p-2">
                               <label class="flex items-center">
-                                <input type="radio" name="versionRadio" value="${ver.id}" ${index === 0 ? "checked" : ""} class="mr-2">
+                                <input type="radio" name="versionRadio" value="${ver.id}" ${checked} class="mr-2">
                                 Version ${ver.id} ${ver.tag ? "- " + ver.tag : ""} <span class="text-sm text-gray-600">[${new Date(ver.timestamp).toLocaleString()}]</span>
                               </label>
                               <details class="mt-2 border rounded">
@@ -124,11 +134,12 @@ document.addEventListener("DOMContentLoaded", function () {
                                 </div>
                               </details>
                            </div>`;
-                });
-                document.getElementById("versionsList").innerHTML = html || "<p>No versions created.</p>";
-                // Removed auto-deploy. Instruct user to select a version.
-                document.getElementById("deployedVersion").innerHTML = "<p>Please select a version to deploy.</p>";
             });
+            document.getElementById("versionsList").innerHTML = html || "<p>No versions created.</p>";
+            if (!deployedID) {
+                document.getElementById("deployedVersion").innerHTML = "<p>Please select a version to deploy.</p>";
+            }
+        });
     }
 
     // Modified loadDeployedVersion to fetch the deployed version.

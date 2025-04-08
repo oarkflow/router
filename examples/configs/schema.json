@@ -1,6 +1,6 @@
 [
     {
-        "route_uri": "/route",
+        "route_uri": "/test-route",
         "route_method": "POST",
         "schema": {
             "type": "object",

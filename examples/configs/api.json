@@ -1,5 +1,5 @@
 {
-    "prefix": "/",
+    "prefix": "/workflow",
     "routes": [
         {
             "route_uri": "/test-route",
