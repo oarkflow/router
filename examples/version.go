@@ -30,7 +30,7 @@ var watchPaths = []string{"./configs"}
 
 // --- Entity Definitions ---
 
-// FileVersion holds file contents and diff info.
+// FileVersion holds file content, diff, and deletion flag.
 type FileVersion struct {
 	Timestamp time.Time `json:"timestamp"`
 	Content   string    `json:"content"`
@@ -47,7 +47,7 @@ type Commit struct {
 	Files     map[string]FileVersion `json:"files"`
 }
 
-// VersionGroup represents a merged version (tag) that can be deployed.
+// VersionGroup represents a merged version (tag) which can be deployed.
 type VersionGroup struct {
 	ID            int                    `json:"id"`
 	Tag           string                 `json:"tag,omitempty"`
@@ -57,17 +57,18 @@ type VersionGroup struct {
 	Files         map[string]FileVersion `json:"files"`
 }
 
-// ManagerState is a snapshot of all persistent state.
+// ManagerState holds all persistent state.
 type ManagerState struct {
-	LatestFiles    map[string]string        `json:"latestFiles"`
-	FileVersions   map[string][]FileVersion `json:"fileVersions"`
-	PendingCommits []Commit                 `json:"pendingCommits"`
-	CommittedFiles map[string]string        `json:"committedFiles"`
-	Versions       []VersionGroup           `json:"versions"`
-	NextCommitID   int                      `json:"nextCommitId"`
-	NextVerID      int                      `json:"nextVerId"`
-	CurrentBranch  string                   `json:"currentBranch"`
-	AuditLog       []string                 `json:"auditLog"`
+	LatestFiles     map[string]string        `json:"latestFiles"`
+	FileVersions    map[string][]FileVersion `json:"fileVersions"`
+	PendingCommits  []Commit                 `json:"pendingCommits"`
+	CommittedFiles  map[string]string        `json:"committedFiles"`
+	Versions        []VersionGroup           `json:"versions"`
+	NextCommitID    int                      `json:"nextCommitId"`
+	NextVerID       int                      `json:"nextVerId"`
+	CurrentBranch   string                   `json:"currentBranch"`
+	AuditLog        []string                 `json:"auditLog"`
+	DeployedVersion *VersionGroup            `json:"deployedVersion,omitempty"`
 }
 
 // --- Persistent Storage with bbolt ---
@@ -86,7 +87,6 @@ func NewStorage(dbFile string) (*Storage, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Create state bucket if not exists.
 	err = db.Update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists([]byte(stateBucket))
 		return err
@@ -109,7 +109,7 @@ func (s *Storage) SaveState(state ManagerState) error {
 	})
 }
 
-// LoadState attempts to load a ManagerState from the database.
+// LoadState loads a ManagerState from the database.
 func (s *Storage) LoadState() (ManagerState, error) {
 	var state ManagerState
 	err := s.db.View(func(tx *bbolt.Tx) error {
@@ -125,7 +125,7 @@ func (s *Storage) LoadState() (ManagerState, error) {
 
 // --- Version Manager ---
 
-// VersionManager holds versioning data and a pointer to the storage engine.
+// VersionManager holds all versioning data and a pointer to persistent storage.
 type VersionManager struct {
 	sync.RWMutex
 	LatestFiles     map[string]string        // latest file content snapshot
@@ -135,29 +135,30 @@ type VersionManager struct {
 	Versions        []VersionGroup           // merged version groups
 	NextCommitID    int                      // auto-increment commit ID
 	NextVerID       int                      // auto-increment version group ID
-	CurrentBranch   string                   // current branch name
+	CurrentBranch   string                   // current branch name (e.g. "main", "feature")
 	AuditLog        []string                 // audit log entries
-	DeployedVersion *VersionGroup            // deployed version
+	DeployedVersion *VersionGroup            // currently deployed version
 	storage         *Storage                 // persistent storage engine
 }
 
 // persistState writes the entire manager state to storage.
 func (vm *VersionManager) persistState() error {
 	state := ManagerState{
-		LatestFiles:    vm.LatestFiles,
-		FileVersions:   vm.FileVersions,
-		PendingCommits: vm.PendingCommits,
-		CommittedFiles: vm.CommittedFiles,
-		Versions:       vm.Versions,
-		NextCommitID:   vm.NextCommitID,
-		NextVerID:      vm.NextVerID,
-		CurrentBranch:  vm.CurrentBranch,
-		AuditLog:       vm.AuditLog,
+		LatestFiles:     vm.LatestFiles,
+		FileVersions:    vm.FileVersions,
+		PendingCommits:  vm.PendingCommits,
+		CommittedFiles:  vm.CommittedFiles,
+		Versions:        vm.Versions,
+		NextCommitID:    vm.NextCommitID,
+		NextVerID:       vm.NextVerID,
+		CurrentBranch:   vm.CurrentBranch,
+		AuditLog:        vm.AuditLog,
+		DeployedVersion: vm.DeployedVersion,
 	}
 	return vm.storage.SaveState(state)
 }
 
-// NewVersionManager initializes a new manager; it attempts to load existing state.
+// NewVersionManager initializes a new manager instance by loading previous state (if available).
 func NewVersionManager(storage *Storage) *VersionManager {
 	vm := &VersionManager{
 		LatestFiles:     make(map[string]string),
@@ -169,10 +170,9 @@ func NewVersionManager(storage *Storage) *VersionManager {
 		NextVerID:       1,
 		CurrentBranch:   "main",
 		AuditLog:        []string{},
-		storage:         storage,
 		DeployedVersion: nil,
+		storage:         storage,
 	}
-	// Attempt to load previous state.
 	if state, err := storage.LoadState(); err == nil {
 		vm.LatestFiles = state.LatestFiles
 		vm.FileVersions = state.FileVersions
@@ -183,10 +183,11 @@ func NewVersionManager(storage *Storage) *VersionManager {
 		vm.NextVerID = state.NextVerID
 		vm.CurrentBranch = state.CurrentBranch
 		vm.AuditLog = state.AuditLog
+		vm.DeployedVersion = state.DeployedVersion
 		log.Println("Loaded persisted state.")
 	} else {
 		log.Println("No previous state found; starting new.")
-		vm.persistState()
+		_ = vm.persistState()
 	}
 	return vm
 }
@@ -249,7 +250,7 @@ func mergeFileVersions(base string, candidates []string) (string, bool) {
 
 // --- Deployment Function ---
 
-// deployVersion stages files to a temporary folder and atomically swaps it with production.
+// deployVersion stages files into a temporary folder then atomically replaces the production folder.
 func deployVersion(ver VersionGroup) error {
 	tempDir := "Prod_temp"
 	if err := os.RemoveAll(tempDir); err != nil {
@@ -288,7 +289,7 @@ func deployVersion(ver VersionGroup) error {
 }
 
 // --- Version Manager Methods ---
-// Each method that changes state calls persistState() to write the latest state.
+// Each state-changing method calls persistState() to update persistent storage.
 
 func (vm *VersionManager) UpdateFile(path, content string, deleted bool) {
 	vm.Lock()
@@ -364,7 +365,6 @@ func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) C
 	}
 	vm.PendingCommits = append(vm.PendingCommits, commit)
 	vm.NextCommitID++
-	// Record audit entry.
 	entry := fmt.Sprintf("Commit %d created on branch '%s'", commit.ID, vm.CurrentBranch)
 	vm.AuditLog = append(vm.AuditLog, entry)
 	_ = vm.persistState()
@@ -420,7 +420,6 @@ func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 	}
 	vm.Versions = append(vm.Versions, mergedVersion)
 	vm.NextVerID++
-	// Remove merged commits (only for current branch).
 	var remaining []Commit
 	for _, commit := range vm.PendingCommits {
 		if commit.Branch != vm.CurrentBranch {
@@ -624,8 +623,6 @@ func watchFiles(paths []string) {
 					continue
 				}
 				content := string(data)
-				diff := versionManager.GetDiff(event.Name, content)
-				log.Printf("Change on %s\nDiff:\n%s", event.Name, diff)
 				versionManager.UpdateFile(event.Name, content, false)
 			}
 		case err, ok := <-watcher.Errors:
@@ -637,7 +634,7 @@ func watchFiles(paths []string) {
 	}
 }
 
-// --- HTTP Handlers and Basic Auth ---
+// --- HTTP Handlers and Basic Auth Middleware ---
 
 func basicAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -757,7 +754,7 @@ func handleSwitchVersion(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to deploy version: %v", err), http.StatusInternalServerError)
 		return
 	}
-	// For switching, we do not alter the committed baseline.
+	// For a simple switch, we update the deployed version but leave baseline unchanged.
 	versionManager.DeployedVersion = selected
 	entry := fmt.Sprintf("Switched to deployed version %d on branch '%s'", selected.ID, versionManager.CurrentBranch)
 	versionManager.AuditLog = append(versionManager.AuditLog, entry)
@@ -812,17 +809,17 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// Initialize storage.
+	// Initialize persistent storage.
 	storage, err := NewStorage(dbFile)
 	if err != nil {
 		log.Fatalf("Error opening storage: %v", err)
 	}
 	defer storage.db.Close()
-	// Initialize version manager.
+	// Initialize version manager (loading previous state if exists).
 	versionManager = NewVersionManager(storage)
 	// Start file watcher.
 	go watchFiles(watchPaths)
-	// Set up HTTP routes with basic auth for sensitive endpoints.
+	// Setup HTTP routes with basic auth.
 	http.HandleFunc("/api/changes", basicAuth(handleChanges))
 	http.HandleFunc("/api/commit", basicAuth(handleCommit))
 	http.HandleFunc("/api/commits", basicAuth(handleGetCommits))
