@@ -1,8 +1,17 @@
 [
     {
         "id": "render",
-        "root": "./static/dist",
-        "prefix": "/renderer",
+        "root": "./website1",
+        "prefix": "/website1",
+        "use_index": true,
+        "compress": true,
+        "index": "index",
+        "extension": ".html"
+    },
+    {
+        "id": "render2",
+        "root": "./website2",
+        "prefix": "/website2",
         "use_index": true,
         "compress": true,
         "index": "index",
