@@ -3,21 +3,22 @@ module github.com/oarkflow/router
 go 1.24.2
 
 require (
+	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gofiber/fiber/v2 v2.52.6
 	github.com/oarkflow/json v0.0.24
 	github.com/oarkflow/log v1.0.82
+	github.com/sergi/go-diff v1.3.1
+	go.etcd.io/bbolt v1.4.0
 )
 
 require (
 	github.com/brianvoe/gofakeit/v6 v6.28.0 // indirect
-	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/goccy/go-reflect v1.2.0 // indirect
 	github.com/gofiber/template v1.8.3 // indirect
 	github.com/gofiber/utils v1.1.0 // indirect
 	github.com/oarkflow/date v0.0.4 // indirect
 	github.com/oarkflow/expr v0.0.11 // indirect
 	github.com/oarkflow/xid v1.2.5 // indirect
-	github.com/sergi/go-diff v1.3.1 // indirect
 )
 
 require (

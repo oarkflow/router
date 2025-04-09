@@ -100,7 +100,7 @@ document.addEventListener("DOMContentLoaded", function () {
     // Load pending commits.
     function loadCommits() {
         fetch("/api/commits", { headers: getAuthHeaders() })
-            .then(response => response.json())
+            .then(response => response.json() || [])
             .then(commits => {
                 let html = "";
                 commits.forEach(commit => {
