@@ -2,7 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -15,39 +18,53 @@ import (
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
+const (
+	Username = "admin"       // set via environment or secure configuration
+	Password = "supersecret" // set via environment or secure configuration
+)
+
 var watchPaths = []string{"./configs"}
 
+// FileVersion holds content and diff info. If Deleted is true, then content is empty.
 type FileVersion struct {
 	Timestamp time.Time `json:"timestamp"`
 	Content   string    `json:"content"`
 	Diff      string    `json:"diff,omitempty"`
+	Deleted   bool      `json:"deleted,omitempty"`
 }
 
+// Commit holds a commit with associated file versions and branch info.
 type Commit struct {
 	ID        int                    `json:"id"`
 	Timestamp time.Time              `json:"timestamp"`
 	Message   string                 `json:"message"`
+	Branch    string                 `json:"branch"`
 	Files     map[string]FileVersion `json:"files"`
 }
 
+// VersionGroup holds a merged version snapshot.
 type VersionGroup struct {
 	ID            int                    `json:"id"`
 	Tag           string                 `json:"tag,omitempty"`
 	CommitMessage string                 `json:"commitMessage,omitempty"`
 	Timestamp     time.Time              `json:"timestamp"`
+	Branch        string                 `json:"branch"`
 	Files         map[string]FileVersion `json:"files"`
 }
 
+// VersionManager holds all commit and version data.
 type VersionManager struct {
-	sync.Mutex
-	latestFiles     map[string]string
-	fileVersions    map[string][]FileVersion
-	commits         []Commit
-	nextCommitID    int
-	versions        []VersionGroup
-	nextVerID       int
-	committedFiles  map[string]string
-	deployedVersion *VersionGroup
+	sync.RWMutex
+	latestFiles     map[string]string        // latest known content (for diff calculations)
+	fileVersions    map[string][]FileVersion // history of file versions (per file)
+	commits         []Commit                 // pending commits (in current branch)
+	nextCommitID    int                      // auto-increment commit id
+	versions        []VersionGroup           // merged versions (all branches)
+	nextVerID       int                      // auto-increment version group id
+	committedFiles  map[string]string        // latest committed file contents (per branch)
+	deployedVersion *VersionGroup            // currently deployed version (in production)
+	currentBranch   string                   // current branch name (e.g., "main", "feature")
+	auditLog        []string                 // simple audit log
 }
 
 func NewVersionManager() *VersionManager {
@@ -60,11 +77,14 @@ func NewVersionManager() *VersionManager {
 		deployedVersion: nil,
 		nextCommitID:    1,
 		nextVerID:       1,
+		currentBranch:   "main",
+		auditLog:        []string{},
 	}
 }
 
 var versionManager = NewVersionManager()
 
+// formatDiff returns a unified diff string from diffmatchpatch diff results.
 func formatDiff(diffs []diffmatchpatch.Diff) string {
 	var result strings.Builder
 	for _, d := range diffs {
@@ -93,47 +113,88 @@ func formatDiff(diffs []diffmatchpatch.Diff) string {
 	return result.String()
 }
 
-func threeWayMerge(base, v1, v2 string) (string, bool) {
-	if v1 == v2 {
-		return v1, false
+// mergeFileVersions applies each candidate’s changes sequentially as a patch
+// to the currently merged result. If any patch fails, a conflict is declared.
+func mergeFileVersions(base string, candidates []string) (string, bool) {
+	merged := base
+	dmp := diffmatchpatch.New()
+	conflictOccurred := false
+	for _, candidate := range candidates {
+		patch := dmp.PatchMake(merged, candidate)
+		result, applied := dmp.PatchApply(patch, merged)
+		// Check if all patch parts applied.
+		for _, ok := range applied {
+			if !ok {
+				conflictOccurred = true
+				break
+			}
+		}
+		if conflictOccurred {
+			break
+		}
+		merged = result
 	}
-	if v1 == base {
-		return v2, false
-	}
-	if v2 == base {
-		return v1, false
-	}
-	return "", true
+	return merged, conflictOccurred
 }
 
+// deployVersion writes files to a temporary folder first then atomically swaps to production.
 func deployVersion(ver VersionGroup) error {
+	tempDir := "Prod_temp"
+	if err := os.RemoveAll(tempDir); err != nil {
+		return fmt.Errorf("failed to clear temp folder: %v", err)
+	}
+	// Write version files into temporary location.
 	for srcPath, fileVersion := range ver.Files {
 		relPath := strings.TrimPrefix(srcPath, "configs/")
-		destPath := filepath.Join("Prod", relPath)
+		destPath := filepath.Join(tempDir, relPath)
 		destDir := filepath.Dir(destPath)
 		if err := os.MkdirAll(destDir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %v", destDir, err)
 		}
+		// Do not write files marked as deleted.
+		if fileVersion.Deleted {
+			continue
+		}
 		if err := os.WriteFile(destPath, []byte(fileVersion.Content), 0644); err != nil {
 			return fmt.Errorf("failed to write file %s: %v", destPath, err)
 		}
-		log.Printf("Deployed %s", destPath)
+		log.Printf("Staged %s", destPath)
 	}
+	// Swap temp folder to production atomically.
+	prodDir := "Prod"
+	backupDir := "Prod_backup"
+	// Backup current production.
+	if _, err := os.Stat(prodDir); err == nil {
+		os.RemoveAll(backupDir)
+		if err := os.Rename(prodDir, backupDir); err != nil {
+			return fmt.Errorf("failed to backup production folder: %v", err)
+		}
+	}
+	if err := os.Rename(tempDir, prodDir); err != nil {
+		// Attempt rollback.
+		os.Rename(backupDir, prodDir)
+		return fmt.Errorf("failed to deploy new version: %v", err)
+	}
+	os.RemoveAll(backupDir)
+	log.Printf("Deployed new version to production.")
 	return nil
 }
 
-func (vm *VersionManager) UpdateFile(path, content string) {
+// UpdateFile records file changes. If content is empty, it is considered a deletion.
+func (vm *VersionManager) UpdateFile(path, content string, deleted bool) {
 	vm.Lock()
 	defer vm.Unlock()
-	version := FileVersion{Timestamp: time.Now(), Content: content}
+	version := FileVersion{Timestamp: time.Now(), Content: content, Deleted: deleted}
 	vm.latestFiles[path] = content
 	vm.fileVersions[path] = append(vm.fileVersions[path], version)
-	log.Printf("File updated: %s", path)
+	vm.auditLog = append(vm.auditLog, fmt.Sprintf("%s updated at %s (deleted=%v)", path, time.Now().Format(time.RFC3339), deleted))
+	log.Printf("File updated: %s (deleted=%v)", path, deleted)
 }
 
+// GetChanges calculates diff between latest file state and last committed state.
 func (vm *VersionManager) GetChanges() map[string]string {
-	vm.Lock()
-	defer vm.Unlock()
+	vm.RLock()
+	defer vm.RUnlock()
 	changes := make(map[string]string)
 	dmp := diffmatchpatch.New()
 	for file, versions := range vm.fileVersions {
@@ -142,7 +203,9 @@ func (vm *VersionManager) GetChanges() map[string]string {
 			baseline = strings.TrimSpace(c)
 		}
 		latest := strings.TrimSpace(versions[len(versions)-1].Content)
-		log.Printf("Comparing file '%s': baseline='%s', latest='%s'", file, baseline, latest)
+		if versions[len(versions)-1].Deleted {
+			latest = ""
+		}
 		if latest == baseline {
 			continue
 		}
@@ -156,6 +219,7 @@ func (vm *VersionManager) GetChanges() map[string]string {
 	return changes
 }
 
+// CreateCommit creates a commit for selected files on the current branch.
 func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) Commit {
 	vm.Lock()
 	defer vm.Unlock()
@@ -164,6 +228,7 @@ func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) C
 		ID:        vm.nextCommitID,
 		Timestamp: time.Now(),
 		Message:   message,
+		Branch:    vm.currentBranch,
 		Files:     make(map[string]FileVersion),
 	}
 	for _, file := range selectedFiles {
@@ -172,7 +237,8 @@ func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) C
 			if c, ok := vm.committedFiles[file]; ok {
 				baseline = strings.TrimSpace(c)
 			}
-			current := strings.TrimSpace(versions[len(versions)-1].Content)
+			currentVersion := versions[len(versions)-1]
+			current := strings.TrimSpace(currentVersion.Content)
 			diffs := dmp.DiffMain(baseline, current, false)
 			dmp.DiffCleanupSemantic(diffs)
 			diffText := formatDiff(diffs)
@@ -180,56 +246,54 @@ func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) C
 				Timestamp: time.Now(),
 				Content:   current,
 				Diff:      diffText,
+				Deleted:   currentVersion.Deleted,
 			}
 			commit.Files[file] = fv
 			vm.committedFiles[file] = current
-			vm.fileVersions[file] = []FileVersion{{Timestamp: time.Now(), Content: current}}
+			vm.fileVersions[file] = []FileVersion{{Timestamp: time.Now(), Content: current, Deleted: currentVersion.Deleted}}
 		}
 	}
 	vm.commits = append(vm.commits, commit)
 	vm.nextCommitID++
-	log.Printf("Created commit %d: %s", commit.ID, message)
+	vm.auditLog = append(vm.auditLog, fmt.Sprintf("Commit %d created on branch '%s'", commit.ID, vm.currentBranch))
+	log.Printf("Created commit %d on branch '%s': %s", commit.ID, vm.currentBranch, message)
 	return commit
 }
 
+// MergeCommits merges all pending commits (on current branch) into a version group.
 func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 	vm.Lock()
 	defer vm.Unlock()
 	var mergedMsg []string
-	fileCommits := make(map[string][]FileVersion)
+	fileCommits := make(map[string][]string) // list of candidate content strings per file
 	var conflicts []string
 	for _, commit := range vm.commits {
+		if commit.Branch != vm.currentBranch {
+			continue
+		}
 		mergedMsg = append(mergedMsg, fmt.Sprintf("Commit %d: %s", commit.ID, commit.Message))
 		for file, version := range commit.Files {
-			fileCommits[file] = append(fileCommits[file], version)
+			candidate := strings.TrimSpace(version.Content)
+			fileCommits[file] = append(fileCommits[file], candidate)
 		}
 	}
 	mergedFiles := make(map[string]FileVersion)
-	for file, changes := range fileCommits {
+	dmp := diffmatchpatch.New()
+	for file, candidates := range fileCommits {
 		base := ""
 		if b, ok := vm.committedFiles[file]; ok {
 			base = strings.TrimSpace(b)
 		}
-		merged := base
-		conflictOccurred := false
-		for _, candidate := range changes {
-			newMerged, conflict := threeWayMerge(base, merged, strings.TrimSpace(candidate.Content))
-			if conflict {
-				conflictOccurred = true
-				break
-			}
-			merged = newMerged
-		}
-		if conflictOccurred {
+		merged, conflict := mergeFileVersions(base, candidates)
+		if conflict {
 			conflicts = append(conflicts, file)
-		} else {
-			dmp := diffmatchpatch.New()
-			finalDiff := formatDiff(dmp.DiffMain(base, merged, false))
-			mergedFiles[file] = FileVersion{
-				Timestamp: time.Now(),
-				Content:   merged,
-				Diff:      finalDiff,
-			}
+			continue
+		}
+		finalDiff := formatDiff(dmp.DiffMain(base, merged, false))
+		mergedFiles[file] = FileVersion{
+			Timestamp: time.Now(),
+			Content:   merged,
+			Diff:      finalDiff,
 		}
 	}
 	if len(conflicts) > 0 {
@@ -240,20 +304,30 @@ func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 		Tag:           tag,
 		CommitMessage: strings.Join(mergedMsg, " | "),
 		Timestamp:     time.Now(),
+		Branch:        vm.currentBranch,
 		Files:         mergedFiles,
 	}
 	vm.versions = append(vm.versions, mergedVersion)
 	vm.nextVerID++
-	vm.commits = []Commit{}
-	log.Printf("Created version %d with tag '%s'", mergedVersion.ID, tag)
+	// Remove commits merged for current branch.
+	var remainingCommits []Commit
+	for _, commit := range vm.commits {
+		if commit.Branch != vm.currentBranch {
+			remainingCommits = append(remainingCommits, commit)
+		}
+	}
+	vm.commits = remainingCommits
+	vm.auditLog = append(vm.auditLog, fmt.Sprintf("Merged commits on branch '%s' into version %d", vm.currentBranch, mergedVersion.ID))
+	log.Printf("Created version %d on branch '%s' with tag '%s'", mergedVersion.ID, vm.currentBranch, tag)
 	return mergedVersion, nil
 }
 
+// MergeSelectedCommits merges only the specified commits.
 func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (VersionGroup, error) {
 	vm.Lock()
 	defer vm.Unlock()
 	var mergedMsg []string
-	fileCommits := make(map[string][]FileVersion)
+	fileCommits := make(map[string][]string)
 	var conflicts []string
 	selectedMap := make(map[int]bool)
 	for _, id := range commitIDs {
@@ -261,41 +335,36 @@ func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (Ver
 	}
 	var remainingCommits []Commit
 	for _, commit := range vm.commits {
+		if commit.Branch != vm.currentBranch {
+			remainingCommits = append(remainingCommits, commit)
+			continue
+		}
 		if selectedMap[commit.ID] {
 			mergedMsg = append(mergedMsg, fmt.Sprintf("Commit %d: %s", commit.ID, commit.Message))
 			for file, fv := range commit.Files {
-				fileCommits[file] = append(fileCommits[file], fv)
+				fileCommits[file] = append(fileCommits[file], strings.TrimSpace(fv.Content))
 			}
 		} else {
 			remainingCommits = append(remainingCommits, commit)
 		}
 	}
 	mergedFiles := make(map[string]FileVersion)
-	for file, changes := range fileCommits {
+	dmp := diffmatchpatch.New()
+	for file, candidates := range fileCommits {
 		base := ""
 		if b, ok := vm.committedFiles[file]; ok {
 			base = strings.TrimSpace(b)
 		}
-		merged := base
-		conflictOccurred := false
-		for _, candidate := range changes {
-			newMerged, conflict := threeWayMerge(base, merged, strings.TrimSpace(candidate.Content))
-			if conflict {
-				conflictOccurred = true
-				break
-			}
-			merged = newMerged
-		}
-		if conflictOccurred {
+		merged, conflict := mergeFileVersions(base, candidates)
+		if conflict {
 			conflicts = append(conflicts, file)
-		} else {
-			dmp := diffmatchpatch.New()
-			finalDiff := formatDiff(dmp.DiffMain(base, merged, false))
-			mergedFiles[file] = FileVersion{
-				Timestamp: time.Now(),
-				Content:   merged,
-				Diff:      finalDiff,
-			}
+			continue
+		}
+		finalDiff := formatDiff(dmp.DiffMain(base, merged, false))
+		mergedFiles[file] = FileVersion{
+			Timestamp: time.Now(),
+			Content:   merged,
+			Diff:      finalDiff,
 		}
 	}
 	if len(conflicts) > 0 {
@@ -306,33 +375,46 @@ func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (Ver
 		Tag:           tag,
 		CommitMessage: strings.Join(mergedMsg, " | "),
 		Timestamp:     time.Now(),
+		Branch:        vm.currentBranch,
 		Files:         mergedFiles,
 	}
 	vm.versions = append(vm.versions, mergedVersion)
 	vm.nextVerID++
 	vm.commits = remainingCommits
-	log.Printf("Created version %d with tag '%s' merging commits: %v", mergedVersion.ID, tag, commitIDs)
+	vm.auditLog = append(vm.auditLog, fmt.Sprintf("Merged selected commits on branch '%s' into version %d", vm.currentBranch, mergedVersion.ID))
+	log.Printf("Created version %d on branch '%s' with tag '%s' merging commits: %v", mergedVersion.ID, vm.currentBranch, tag, commitIDs)
 	return mergedVersion, nil
 }
 
+// RevertPendingCommits discards pending commits on the current branch.
 func (vm *VersionManager) RevertPendingCommits() {
 	vm.Lock()
 	defer vm.Unlock()
-	vm.commits = []Commit{}
+	var remaining []Commit
+	for _, commit := range vm.commits {
+		if commit.Branch != vm.currentBranch {
+			remaining = append(remaining, commit)
+		}
+	}
+	vm.commits = remaining
+	vm.auditLog = append(vm.auditLog, fmt.Sprintf("Pending commits on branch '%s' reverted.", vm.currentBranch))
 	log.Println("Pending commits reverted.")
 }
 
+// AbortMerge logs that a merge was aborted.
 func (vm *VersionManager) AbortMerge() {
 	vm.Lock()
 	defer vm.Unlock()
+	vm.auditLog = append(vm.auditLog, fmt.Sprintf("Merge aborted on branch '%s'", vm.currentBranch))
 	log.Println("Merge aborted. No changes applied.")
 }
 
-func (vm *VersionManager) GetDiff(path, newContent string) string {
-	vm.Lock()
-	defer vm.Unlock()
+// GetDiff returns diff between stored file and new content.
+func (vm *VersionManager) GetDiff(filePath, newContent string) string {
+	vm.RLock()
+	defer vm.RUnlock()
 	baseline := ""
-	if content, ok := vm.latestFiles[path]; ok {
+	if content, ok := vm.latestFiles[filePath]; ok {
 		baseline = content
 	}
 	dmp := diffmatchpatch.New()
@@ -341,16 +423,55 @@ func (vm *VersionManager) GetDiff(path, newContent string) string {
 	return formatDiff(diffs)
 }
 
+// SwitchBranch changes the current branch.
+func (vm *VersionManager) SwitchBranch(branch string) {
+	vm.Lock()
+	defer vm.Unlock()
+	vm.currentBranch = branch
+	vm.auditLog = append(vm.auditLog, fmt.Sprintf("Switched to branch '%s'", branch))
+	log.Printf("Switched to branch: %s", branch)
+}
+
+// RollbackDeployment reverts production to an earlier version and resets the committed state.
+func (vm *VersionManager) RollbackDeployment(versionID int) error {
+	vm.Lock()
+	defer vm.Unlock()
+	var target *VersionGroup
+	for _, ver := range vm.versions {
+		if ver.ID == versionID && ver.Branch == vm.currentBranch {
+			target = &ver
+			break
+		}
+	}
+	if target == nil {
+		return errors.New("version not found for rollback on current branch")
+	}
+	// Deploy the target version.
+	if err := deployVersion(*target); err != nil {
+		return err
+	}
+	// Reset committed state to target version.
+	for file, fv := range target.Files {
+		vm.committedFiles[file] = fv.Content
+		vm.fileVersions[file] = []FileVersion{{Timestamp: time.Now(), Content: fv.Content, Deleted: fv.Deleted}}
+	}
+	// Clear any pending commits.
+	vm.commits = []Commit{}
+	vm.deployedVersion = target
+	vm.auditLog = append(vm.auditLog, fmt.Sprintf("Rolled back deployment to version %d on branch '%s'", target.ID, vm.currentBranch))
+	log.Printf("Rolled back deployment to version %d", target.ID)
+	return nil
+}
+
+// watchFiles monitors file system events including modifications, creations, deletions and renames.
 func watchFiles(paths []string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer func() {
-		_ = watcher.Close()
-	}()
+	defer func() { _ = watcher.Close() }()
 	for _, root := range paths {
-		err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		err = filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
@@ -376,8 +497,14 @@ func watchFiles(paths []string) {
 			if strings.HasSuffix(event.Name, "~") {
 				continue
 			}
+			// Handle deletion/rename events as file removal.
+			if event.Op&fsnotify.Remove != 0 || event.Op&fsnotify.Rename != 0 {
+				versionManager.UpdateFile(event.Name, "", true)
+				log.Printf("File removed: %s", event.Name)
+				continue
+			}
 			if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
-				data, err := os.ReadFile(event.Name)
+				data, err := ioutil.ReadFile(event.Name)
 				if err != nil {
 					log.Printf("Error reading %s: %v", event.Name, err)
 					continue
@@ -385,7 +512,7 @@ func watchFiles(paths []string) {
 				content := string(data)
 				diff := versionManager.GetDiff(event.Name, content)
 				log.Printf("Change on %s\nDiff:\n%s", event.Name, diff)
-				versionManager.UpdateFile(event.Name, content)
+				versionManager.UpdateFile(event.Name, content, false)
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -393,6 +520,20 @@ func watchFiles(paths []string) {
 			}
 			log.Println("Watcher error:", err)
 		}
+	}
+}
+
+// ---- HTTP Handlers and basic auth middleware ----
+
+func basicAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		u, p, ok := r.BasicAuth()
+		if !ok || u != Username || p != Password {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+			http.Error(w, "Unauthorized.", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
 	}
 }
 
@@ -417,8 +558,8 @@ func handleCommit(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleGetCommits(w http.ResponseWriter, r *http.Request) {
-	versionManager.Lock()
-	defer versionManager.Unlock()
+	versionManager.RLock()
+	defer versionManager.RUnlock()
 	_ = json.NewEncoder(w).Encode(versionManager.commits)
 }
 
@@ -470,8 +611,8 @@ func handleAbortMerge(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleGetVersions(w http.ResponseWriter, r *http.Request) {
-	versionManager.Lock()
-	defer versionManager.Unlock()
+	versionManager.RLock()
+	defer versionManager.RUnlock()
 	_ = json.NewEncoder(w).Encode(versionManager.versions)
 }
 
@@ -489,7 +630,7 @@ func handleSwitchVersion(w http.ResponseWriter, r *http.Request) {
 	defer versionManager.Unlock()
 	var selected *VersionGroup
 	for _, ver := range versionManager.versions {
-		if ver.ID == payload.VersionID {
+		if ver.ID == payload.VersionID && ver.Branch == versionManager.currentBranch {
 			selected = &ver
 			break
 		}
@@ -502,19 +643,52 @@ func handleSwitchVersion(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to deploy version: %v", err), http.StatusInternalServerError)
 		return
 	}
+	// For switching version, we do not alter the committed baseline.
 	versionManager.deployedVersion = selected
+	versionManager.auditLog = append(versionManager.auditLog, fmt.Sprintf("Switched to deployed version %d on branch '%s'", selected.ID, versionManager.currentBranch))
 	log.Printf("Switched to deployed version %d", selected.ID)
 	_ = json.NewEncoder(w).Encode(selected)
 }
 
 func handleDeployedVersion(w http.ResponseWriter, r *http.Request) {
-	versionManager.Lock()
-	defer versionManager.Unlock()
+	versionManager.RLock()
+	defer versionManager.RUnlock()
 	if versionManager.deployedVersion == nil {
 		http.Error(w, "No deployed version", http.StatusNotFound)
 		return
 	}
 	_ = json.NewEncoder(w).Encode(versionManager.deployedVersion)
+}
+
+type SwitchBranchPayload struct {
+	Branch string `json:"branch"`
+}
+
+func handleSwitchBranch(w http.ResponseWriter, r *http.Request) {
+	var payload SwitchBranchPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || strings.TrimSpace(payload.Branch) == "" {
+		http.Error(w, "Invalid branch payload", http.StatusBadRequest)
+		return
+	}
+	versionManager.SwitchBranch(payload.Branch)
+	_, _ = w.Write([]byte(fmt.Sprintf("Switched to branch '%s'", payload.Branch)))
+}
+
+type RollbackPayload struct {
+	VersionID int `json:"version_id"`
+}
+
+func handleRollback(w http.ResponseWriter, r *http.Request) {
+	var payload RollbackPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if err := versionManager.RollbackDeployment(payload.VersionID); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	_, _ = w.Write([]byte(fmt.Sprintf("Rolled back deployment to version %d", payload.VersionID)))
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -523,16 +697,18 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	go watchFiles(watchPaths)
-	http.HandleFunc("/api/changes", handleChanges)
-	http.HandleFunc("/api/commit", handleCommit)
-	http.HandleFunc("/api/commits", handleGetCommits)
-	http.HandleFunc("/api/version", handleCreateVersion)
-	http.HandleFunc("/api/version/mergeSelected", handleMergeSelectedCommits)
-	http.HandleFunc("/api/version/revert", handleRevertCommits)
-	http.HandleFunc("/api/merge/abort", handleAbortMerge)
-	http.HandleFunc("/api/versions", handleGetVersions)
-	http.HandleFunc("/api/version/switch", handleSwitchVersion)
-	http.HandleFunc("/api/deployedVersion", handleDeployedVersion)
+	http.HandleFunc("/api/changes", basicAuth(handleChanges))
+	http.HandleFunc("/api/commit", basicAuth(handleCommit))
+	http.HandleFunc("/api/commits", basicAuth(handleGetCommits))
+	http.HandleFunc("/api/version", basicAuth(handleCreateVersion))
+	http.HandleFunc("/api/version/mergeSelected", basicAuth(handleMergeSelectedCommits))
+	http.HandleFunc("/api/version/revert", basicAuth(handleRevertCommits))
+	http.HandleFunc("/api/merge/abort", basicAuth(handleAbortMerge))
+	http.HandleFunc("/api/versions", basicAuth(handleGetVersions))
+	http.HandleFunc("/api/version/switch", basicAuth(handleSwitchVersion))
+	http.HandleFunc("/api/deployedVersion", basicAuth(handleDeployedVersion))
+	http.HandleFunc("/api/branch/switch", basicAuth(handleSwitchBranch))
+	http.HandleFunc("/api/deployment/rollback", basicAuth(handleRollback))
 	http.HandleFunc("/", handleIndex)
 	fs := http.FileServer(http.Dir("./static"))
 	http.Handle("/static/", http.StripPrefix("/static/", fs))

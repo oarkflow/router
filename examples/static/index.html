@@ -8,49 +8,56 @@
 </head>
 
 <body class="bg-gray-100 text-gray-800">
-    <div class="container mx-auto p-4">
-        <h1 class="text-3xl font-bold mb-4">Lite Git for Config Files</h1>
-        <div class="mb-6">
-            <button id="devModeBtn" class="px-4 py-2 bg-blue-500 text-white rounded mr-2">Developer Mode</button>
-            <button id="prodModeBtn" class="px-4 py-2 bg-green-500 text-white rounded">Production Mode</button>
+<div class="container mx-auto p-4">
+    <h1 class="text-3xl font-bold mb-4">Lite Git for Config Files</h1>
+    <div class="mb-6">
+        <button id="devModeBtn" class="px-4 py-2 bg-blue-500 text-white rounded mr-2">Developer Mode</button>
+        <button id="prodModeBtn" class="px-4 py-2 bg-green-500 text-white rounded mr-2">Production Mode</button>
+        <button id="branchSwitchBtn" class="px-4 py-2 bg-indigo-500 text-white rounded mr-2">Switch Branch</button>
+    </div>
+    <div class="mb-4">
+        <label for="branchInput" class="mr-2">Current Branch:</label>
+        <input id="branchInput" type="text" value="main" class="border p-1">
+    </div>
+    <div id="devSection">
+        <h2 class="text-2xl font-semibold mb-2">Developer Mode - Create Commit</h2>
+        <div id="fileChanges" class="mb-4 border p-2 bg-white">
+            <p>Loading changes...</p>
         </div>
-        <div id="devSection">
-            <h2 class="text-2xl font-semibold mb-2">Developer Mode - Create Commit</h2>
-            <div id="fileChanges" class="mb-4 border p-2 bg-white">
-                <p>Loading changes...</p>
-            </div>
-            <div class="mb-4 border p-2 bg-white">
-                <h3 class="font-semibold mb-2">Select files to commit:</h3>
-                <div id="fileSelectList"></div>
-            </div>
-            <div class="mb-4">
-                <input id="commitMsgInput" type="text" placeholder="Commit message" class="border p-1 mr-2">
-                <button id="commitBtn" class="px-4 py-2 bg-purple-500 text-white rounded">Add Commit</button>
-            </div>
-            <div class="mb-4">
-                <h3 class="text-xl">Pending Commits</h3>
-                <div id="commitsList" class="border p-2 bg-white"></div>
-            </div>
-            <div class="mb-4">
-                <input id="mergeTagInput" type="text" placeholder="Merge tag/label" class="border p-1 mr-2">
-                <button id="mergeSelectedBtn" class="px-4 py-2 bg-indigo-500 text-white rounded">Merge Selected
-                    Commits</button>
-            </div>
+        <div class="mb-4 border p-2 bg-white">
+            <h3 class="font-semibold mb-2">Select files to commit:</h3>
+            <div id="fileSelectList"></div>
         </div>
-        <div id="prodSection" class="hidden">
-            <h2 class="text-2xl font-semibold mb-2">Production Mode - Released Versions</h2>
-            <div class="mb-4">
-                <h3 class="text-xl">Created Versions</h3>
-                <div id="versionsList" class="border p-2 bg-white"></div>
-            </div>
-            <div class="mb-4">
-                <button id="switchVersionBtn" class="px-4 py-2 bg-yellow-500 text-white rounded">Switch Version</button>
-            </div>
-            <div id="deployedVersion" class="border p-4 bg-white">
-                <p>No version deployed yet.</p>
-            </div>
+        <div class="mb-4">
+            <input id="commitMsgInput" type="text" placeholder="Commit message" class="border p-1 mr-2">
+            <button id="commitBtn" class="px-4 py-2 bg-purple-500 text-white rounded">Add Commit</button>
+        </div>
+        <div class="mb-4">
+            <h3 class="text-xl">Pending Commits</h3>
+            <div id="commitsList" class="border p-2 bg-white"></div>
+        </div>
+        <div class="mb-4">
+            <input id="mergeTagInput" type="text" placeholder="Merge tag/label" class="border p-1 mr-2">
+            <button id="mergeSelectedBtn" class="px-4 py-2 bg-indigo-500 text-white rounded">Merge Selected
+                Commits</button>
         </div>
     </div>
-    <script src="/static/app.js"></script>
+    <div id="prodSection" class="hidden">
+        <h2 class="text-2xl font-semibold mb-2">Production Mode - Released Versions</h2>
+        <div class="mb-4">
+            <h3 class="text-xl">Created Versions</h3>
+            <div id="versionsList" class="border p-2 bg-white"></div>
+        </div>
+        <div class="mb-4">
+            <button id="switchVersionBtn" class="px-4 py-2 bg-yellow-500 text-white rounded mr-2">Switch Version</button>
+            <button id="rollbackVersionBtn" class="px-4 py-2 bg-red-500 text-white rounded">Rollback Deployment</button>
+        </div>
+        <div id="deployedVersion" class="border p-4 bg-white">
+            <p>No version deployed yet.</p>
+        </div>
+    </div>
+</div>
+<script src="/static/app.js"></script>
 </body>
+
 </html>

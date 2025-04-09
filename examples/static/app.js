@@ -1,11 +1,14 @@
 document.addEventListener("DOMContentLoaded", function () {
     const devModeBtn = document.getElementById("devModeBtn");
     const prodModeBtn = document.getElementById("prodModeBtn");
+    const branchSwitchBtn = document.getElementById("branchSwitchBtn");
     const devSection = document.getElementById("devSection");
     const prodSection = document.getElementById("prodSection");
     const commitBtn = document.getElementById("commitBtn");
     const mergeSelectedBtn = document.getElementById("mergeSelectedBtn");
     const switchVersionBtn = document.getElementById("switchVersionBtn");
+    const rollbackVersionBtn = document.getElementById("rollbackVersionBtn");
+    const branchInput = document.getElementById("branchInput");
 
     // Switch to Developer Mode.
     devModeBtn.addEventListener("click", () => {
@@ -23,17 +26,50 @@ document.addEventListener("DOMContentLoaded", function () {
         loadDeployedVersion();
     });
 
+    // Switch Branch.
+    branchSwitchBtn.addEventListener("click", () => {
+        const branch = branchInput.value.trim();
+        if (!branch) {
+            alert("Please enter a branch name.");
+            return;
+        }
+        const payload = { branch: branch };
+        fetch("/api/branch/switch", {
+            method: "POST",
+            headers: getAuthHeaders(),
+            body: JSON.stringify(payload)
+        })
+            .then(response => {
+                if (!response.ok) {
+                    return response.text().then(err => { throw new Error(err) });
+                }
+                alert("Switched branch to " + branch);
+                // Reload commits and versions for the current branch.
+                loadCommits();
+                loadVersions();
+            })
+            .catch(err => alert("Error switching branch: " + err.message));
+    });
+
+    // Helper: get authentication headers.
+    function getAuthHeaders() {
+        const credentials = btoa("admin:supersecret"); // In production set securely.
+        return {
+            "Content-Type": "application/json",
+            "Authorization": "Basic " + credentials
+        };
+    }
+
     // Load file changes for commit creation.
     function loadFileChanges() {
         const fileChangesDiv = document.getElementById("fileChanges");
         const fileSelectList = document.getElementById("fileSelectList");
-        fetch("/api/changes")
+        fetch("/api/changes", { headers: getAuthHeaders() })
             .then(response => response.json())
             .then(data => {
                 let changesHTML = "";
                 let fileListHTML = "";
                 for (let file in data) {
-                    // Only include files with non-empty diff.
                     if (!data[file].trim()) continue;
                     const diffLines = data[file].split("\n").map(line => {
                         if (line.startsWith("+"))
@@ -61,9 +97,9 @@ document.addEventListener("DOMContentLoaded", function () {
             });
     }
 
-    // Load pending commits as accordions.
+    // Load pending commits.
     function loadCommits() {
-        fetch("/api/commits")
+        fetch("/api/commits", { headers: getAuthHeaders() })
             .then(response => response.json())
             .then(commits => {
                 let html = "";
@@ -94,16 +130,15 @@ document.addEventListener("DOMContentLoaded", function () {
             });
     }
 
-    // Modified loadVersions: show versions as accordions with radio buttons.
+    // Load versions in production view.
     function loadVersions() {
-        // Fetch both all versions and deployed version.
         Promise.all([
-            fetch("/api/versions").then(response => response.json()),
-            fetch("/api/deployedVersion").then(response => response.ok ? response.json() : null)
+            fetch("/api/versions", { headers: getAuthHeaders() }).then(response => response.json()),
+            fetch("/api/deployedVersion", { headers: getAuthHeaders() }).then(response => response.ok ? response.json() : null)
         ]).then(([versions, deployedVersion]) => {
             let deployedID = deployedVersion ? deployedVersion.id : null;
             let html = "";
-            versions.forEach((ver, index) => {
+            versions.forEach((ver) => {
                 let filesHTML = "";
                 for (let file in ver.files) {
                     filesHTML += `<details class="ml-4 mb-2 border rounded">
@@ -114,13 +149,7 @@ document.addEventListener("DOMContentLoaded", function () {
                               </div>
                            </details>`;
                 }
-                // Mark version as selected if it matches the deployed version, otherwise use default (the first version if no deployed version)
-                let checked = "";
-                if (deployedID) {
-                    if (ver.id === deployedID) {
-                        checked = "checked";
-                    }
-                }
+                let checked = (ver.id === deployedID) ? "checked" : "";
                 html += `<div class="mb-4 border rounded p-2">
                               <label class="flex items-center">
                                 <input type="radio" name="versionRadio" value="${ver.id}" ${checked} class="mr-2">
@@ -142,9 +171,9 @@ document.addEventListener("DOMContentLoaded", function () {
         });
     }
 
-    // Modified loadDeployedVersion to fetch the deployed version.
+    // Load the deployed version details.
     function loadDeployedVersion() {
-        fetch("/api/deployedVersion")
+        fetch("/api/deployedVersion", { headers: getAuthHeaders() })
             .then(response => {
                 if (!response.ok) {
                     document.getElementById("deployedVersion").innerHTML = "<p>No version deployed.</p>";
@@ -170,12 +199,6 @@ document.addEventListener("DOMContentLoaded", function () {
             .catch(err => console.error(err));
     }
 
-    // Global function to respond to version switch.
-    window.switchVersion = function (versionID) {
-        console.log("Switched to version " + versionID);
-        loadDeployedVersion();
-    };
-
     // Create a commit.
     commitBtn.addEventListener("click", function () {
         const commitMsg = document.getElementById("commitMsgInput").value;
@@ -196,14 +219,13 @@ document.addEventListener("DOMContentLoaded", function () {
         };
         fetch("/api/commit", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: getAuthHeaders(),
             body: JSON.stringify(payload)
         })
             .then(response => response.json())
             .then(() => {
-                alert("Commit created.");
                 loadCommits();
-                loadFileChanges(); // refresh file changes so committed files don't appear
+                loadFileChanges();
             })
             .catch(err => console.error(err));
     });
@@ -225,7 +247,7 @@ document.addEventListener("DOMContentLoaded", function () {
         const payload = { tag: tag, commit_ids: selectedIDs };
         fetch("/api/version/mergeSelected", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: getAuthHeaders(),
             body: JSON.stringify(payload)
         })
             .then(response => {
@@ -235,7 +257,6 @@ document.addEventListener("DOMContentLoaded", function () {
                 return response.json();
             })
             .then(data => {
-                alert(`Version ${data.id} created.`);
                 loadVersions();
                 loadCommits();
                 loadFileChanges();
@@ -245,7 +266,7 @@ document.addEventListener("DOMContentLoaded", function () {
             });
     });
 
-    // Update Switch Version button event handler.
+    // Switch Version – deploys the selected version without changing the committed baseline.
     switchVersionBtn.addEventListener("click", function () {
         const radios = document.getElementsByName("versionRadio");
         let selected = null;
@@ -259,7 +280,7 @@ document.addEventListener("DOMContentLoaded", function () {
             const payload = { version_id: parseInt(selected) };
             fetch("/api/version/switch", {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: getAuthHeaders(),
                 body: JSON.stringify(payload)
             })
                 .then(response => {
@@ -269,7 +290,6 @@ document.addEventListener("DOMContentLoaded", function () {
                     return response.json();
                 })
                 .then(data => {
-                    alert(`Switched to version ${data.id}`);
                     loadDeployedVersion();
                 })
                 .catch(err => {
@@ -277,6 +297,40 @@ document.addEventListener("DOMContentLoaded", function () {
                 });
         } else {
             alert("Please select a version.");
+        }
+    });
+
+    // Rollback Deployment – deploys an older version and resets the committed baseline.
+    rollbackVersionBtn.addEventListener("click", function () {
+        const radios = document.getElementsByName("versionRadio");
+        let selected = null;
+        for (let r of radios) {
+            if (r.checked) {
+                selected = r.value;
+                break;
+            }
+        }
+        if (selected) {
+            const payload = { version_id: parseInt(selected) };
+            fetch("/api/deployment/rollback", {
+                method: "POST",
+                headers: getAuthHeaders(),
+                body: JSON.stringify(payload)
+            })
+                .then(response => {
+                    if (!response.ok) {
+                        return response.text().then(error => { throw new Error(error); });
+                    }
+                    return response.text();
+                })
+                .then(msg => {
+                    loadDeployedVersion();
+                })
+                .catch(err => {
+                    alert("Rollback error: " + err.message);
+                });
+        } else {
+            alert("Please select a version to rollback to.");
         }
     });
 
