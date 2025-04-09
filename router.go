@@ -289,7 +289,11 @@ func (dr *Router) dispatch(c *fiber.Ctx) error {
 						c.Response().Header.Set("Content-Type", "text/html")
 						return c.Send(data)
 					}
-					filePath = filepath.Join(filePath, "index.html")
+					file := "index.html"
+					if sr.Index != "" {
+						file = sr.Index
+					}
+					filePath = filepath.Join(filePath, file)
 				}
 				if _, err := os.Stat(filePath); err == nil {
 					ext := filepath.Ext(filePath)
