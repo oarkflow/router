@@ -510,8 +510,7 @@ func watchFiles(paths []string) {
 					continue
 				}
 				content := string(data)
-				diff := versionManager.GetDiff(event.Name, content)
-				log.Printf("Change on %s\nDiff:\n%s", event.Name, diff)
+				log.Printf("Change on %s\n", event.Name)
 				versionManager.UpdateFile(event.Name, content, false)
 			}
 		case err, ok := <-watcher.Errors:
