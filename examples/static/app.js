@@ -6,7 +6,6 @@ document.addEventListener("DOMContentLoaded", function () {
     const commitBtn = document.getElementById("commitBtn");
     const mergeSelectedBtn = document.getElementById("mergeSelectedBtn");
     const switchVersionBtn = document.getElementById("switchVersionBtn");
-    const initBtn = document.getElementById("initBtn");
 
     // Switch to Developer Mode.
     devModeBtn.addEventListener("click", () => {
@@ -280,27 +279,6 @@ document.addEventListener("DOMContentLoaded", function () {
             alert("Please select a version.");
         }
     });
-
-    // Add event listener for Init button.
-    if (initBtn) {
-        initBtn.addEventListener("click", function () {
-            fetch("/api/init")
-                .then(response => {
-                    if (!response.ok) {
-                        return response.text().then(err => { throw new Error(err); });
-                    }
-                    return response.text();
-                })
-                .then(message => {
-                    alert(message);
-                    loadCommits();
-                    loadFileChanges();
-                })
-                .catch(err => {
-                    alert("Init error: " + err.message);
-                });
-        });
-    }
 
     // Start with Developer Mode.
     devModeBtn.click();
