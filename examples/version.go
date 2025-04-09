@@ -21,17 +21,16 @@ import (
 )
 
 const (
-	Username = "admin"       // Load from environment/configuration in production
-	Password = "supersecret" // Load from environment/configuration in production
-
-	dbFile = "versionmanager.db"
+	Username = "admin"       // In production load securely (e.g. via env vars)
+	Password = "supersecret" // In production load securely (e.g. via env vars)
+	dbFile   = "versionmanager.db"
 )
 
 var watchPaths = []string{"./configs"}
 
-// --- Entity definitions ---
+// --- Entity Definitions ---
 
-// FileVersion holds content and diff info. If Deleted is true, then content is empty.
+// FileVersion holds file contents and diff info.
 type FileVersion struct {
 	Timestamp time.Time `json:"timestamp"`
 	Content   string    `json:"content"`
@@ -39,7 +38,7 @@ type FileVersion struct {
 	Deleted   bool      `json:"deleted,omitempty"`
 }
 
-// Commit holds a commit with associated file versions and branch info.
+// Commit represents a commit with a set of file versions.
 type Commit struct {
 	ID        int                    `json:"id"`
 	Timestamp time.Time              `json:"timestamp"`
@@ -48,7 +47,7 @@ type Commit struct {
 	Files     map[string]FileVersion `json:"files"`
 }
 
-// VersionGroup holds a merged version snapshot.
+// VersionGroup represents a merged version (tag) that can be deployed.
 type VersionGroup struct {
 	ID            int                    `json:"id"`
 	Tag           string                 `json:"tag,omitempty"`
@@ -58,36 +57,39 @@ type VersionGroup struct {
 	Files         map[string]FileVersion `json:"files"`
 }
 
-// --- Persistent Storage using bbolt ---
+// ManagerState is a snapshot of all persistent state.
+type ManagerState struct {
+	LatestFiles    map[string]string        `json:"latestFiles"`
+	FileVersions   map[string][]FileVersion `json:"fileVersions"`
+	PendingCommits []Commit                 `json:"pendingCommits"`
+	CommittedFiles map[string]string        `json:"committedFiles"`
+	Versions       []VersionGroup           `json:"versions"`
+	NextCommitID   int                      `json:"nextCommitId"`
+	NextVerID      int                      `json:"nextVerId"`
+	CurrentBranch  string                   `json:"currentBranch"`
+	AuditLog       []string                 `json:"auditLog"`
+}
 
-// Storage encapsulates a bbolt DB instance.
+// --- Persistent Storage with bbolt ---
+
+const stateBucket = "State"
+const stateKey = "manager"
+
+// Storage encapsulates our bbolt DB.
 type Storage struct {
 	db *bbolt.DB
 }
 
-var (
-	commitsBucket     = []byte("Commits")
-	versionsBucket    = []byte("Versions")
-	branchesBucket    = []byte("Branches")
-	committedFilesBkt = []byte("CommittedFiles")
-	auditLogBucket    = []byte("AuditLog")
-)
-
-// NewStorage opens (or creates) the bolt database and ensures that buckets exist.
+// NewStorage opens (or creates) a Bolt database and ensures the state bucket exists.
 func NewStorage(dbFile string) (*Storage, error) {
 	db, err := bbolt.Open(dbFile, 0600, &bbolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		return nil, err
 	}
-	// Ensure buckets exist.
+	// Create state bucket if not exists.
 	err = db.Update(func(tx *bbolt.Tx) error {
-		for _, bkt := range [][]byte{commitsBucket, versionsBucket, branchesBucket, committedFilesBkt, auditLogBucket} {
-			_, err := tx.CreateBucketIfNotExists(bkt)
-			if err != nil {
-				return fmt.Errorf("create bucket %s: %v", bkt, err)
-			}
-		}
-		return nil
+		_, err := tx.CreateBucketIfNotExists([]byte(stateBucket))
+		return err
 	})
 	if err != nil {
 		return nil, err
@@ -95,139 +97,97 @@ func NewStorage(dbFile string) (*Storage, error) {
 	return &Storage{db: db}, nil
 }
 
-// SaveEntity saves an entity (e.g. commit or version) to a specified bucket using its ID as key.
-func (s *Storage) SaveEntity(bucket []byte, id int, entity interface{}) error {
-	data, err := json.Marshal(entity)
+// SaveState persists a ManagerState in the state bucket.
+func (s *Storage) SaveState(state ManagerState) error {
+	data, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
 	return s.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucket)
-		key := []byte(fmt.Sprintf("%d", id))
-		return b.Put(key, data)
+		b := tx.Bucket([]byte(stateBucket))
+		return b.Put([]byte(stateKey), data)
 	})
 }
 
-// LoadEntities loads all entities from a bucket and unmarshals them into a slice.
-func (s *Storage) LoadEntities(bucket []byte, out interface{}) error {
-	return s.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucket)
-		var list []json.RawMessage
-		err := b.ForEach(func(k, v []byte) error {
-			list = append(list, v)
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		data, err := json.Marshal(list)
-		if err != nil {
-			return err
-		}
-		return json.Unmarshal(data, out)
-	})
-}
-
-// SaveCommittedFiles stores the committedFiles map.
-func (s *Storage) SaveCommittedFiles(files map[string]string) error {
-	data, err := json.Marshal(files)
-	if err != nil {
-		return err
-	}
-	return s.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(committedFilesBkt)
-		return b.Put([]byte("base"), data)
-	})
-}
-
-// LoadCommittedFiles loads the committedFiles map.
-func (s *Storage) LoadCommittedFiles() (map[string]string, error) {
-	var files map[string]string
+// LoadState attempts to load a ManagerState from the database.
+func (s *Storage) LoadState() (ManagerState, error) {
+	var state ManagerState
 	err := s.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(committedFilesBkt)
-		data := b.Get([]byte("base"))
+		b := tx.Bucket([]byte(stateBucket))
+		data := b.Get([]byte(stateKey))
 		if data == nil {
-			files = make(map[string]string)
-			return nil
+			return errors.New("state not found")
 		}
-		return json.Unmarshal(data, &files)
+		return json.Unmarshal(data, &state)
 	})
-	return files, err
-}
-
-// SaveBranch persists the current branch.
-func (s *Storage) SaveBranch(branch string) error {
-	return s.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(branchesBucket)
-		return b.Put([]byte("current"), []byte(branch))
-	})
-}
-
-// LoadBranch retrieves the current branch.
-func (s *Storage) LoadBranch() (string, error) {
-	var branch string
-	err := s.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(branchesBucket)
-		data := b.Get([]byte("current"))
-		if data == nil {
-			branch = "main"
-		} else {
-			branch = string(data)
-		}
-		return nil
-	})
-	return branch, err
-}
-
-// AppendAudit appends an audit log entry.
-func (s *Storage) AppendAudit(entry string) error {
-	return s.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(auditLogBucket)
-		id, _ := b.NextSequence()
-		key := []byte(fmt.Sprintf("%d", id))
-		return b.Put(key, []byte(entry))
-	})
+	return state, err
 }
 
 // --- Version Manager ---
 
-// VersionManager holds all commit and version data along with a pointer to the storage engine.
+// VersionManager holds versioning data and a pointer to the storage engine.
 type VersionManager struct {
 	sync.RWMutex
-	latestFiles     map[string]string        // latest known content
-	fileVersions    map[string][]FileVersion // history of file versions (per file)
-	commits         []Commit                 // pending commits (in current branch)
-	nextCommitID    int                      // auto-increment commit id
-	versions        []VersionGroup           // merged versions (all branches)
-	nextVerID       int                      // auto-increment version group id
-	committedFiles  map[string]string        // latest committed file contents (per branch)
-	deployedVersion *VersionGroup            // currently deployed version
-	currentBranch   string                   // current branch name (e.g. "main", "feature")
-	auditLog        []string                 // audit log entries
-	storage         *Storage
+	LatestFiles     map[string]string        // latest file content snapshot
+	FileVersions    map[string][]FileVersion // history of file versions per file
+	PendingCommits  []Commit                 // pending commits for current branch
+	CommittedFiles  map[string]string        // baseline committed file contents per branch
+	Versions        []VersionGroup           // merged version groups
+	NextCommitID    int                      // auto-increment commit ID
+	NextVerID       int                      // auto-increment version group ID
+	CurrentBranch   string                   // current branch name
+	AuditLog        []string                 // audit log entries
+	DeployedVersion *VersionGroup            // deployed version
+	storage         *Storage                 // persistent storage engine
 }
 
+// persistState writes the entire manager state to storage.
+func (vm *VersionManager) persistState() error {
+	state := ManagerState{
+		LatestFiles:    vm.LatestFiles,
+		FileVersions:   vm.FileVersions,
+		PendingCommits: vm.PendingCommits,
+		CommittedFiles: vm.CommittedFiles,
+		Versions:       vm.Versions,
+		NextCommitID:   vm.NextCommitID,
+		NextVerID:      vm.NextVerID,
+		CurrentBranch:  vm.CurrentBranch,
+		AuditLog:       vm.AuditLog,
+	}
+	return vm.storage.SaveState(state)
+}
+
+// NewVersionManager initializes a new manager; it attempts to load existing state.
 func NewVersionManager(storage *Storage) *VersionManager {
 	vm := &VersionManager{
-		latestFiles:    make(map[string]string),
-		fileVersions:   make(map[string][]FileVersion),
-		commits:        []Commit{},
-		versions:       []VersionGroup{},
-		committedFiles: make(map[string]string),
-		nextCommitID:   1,
-		nextVerID:      1,
-		currentBranch:  "main",
-		auditLog:       []string{},
-		storage:        storage,
+		LatestFiles:     make(map[string]string),
+		FileVersions:    make(map[string][]FileVersion),
+		PendingCommits:  []Commit{},
+		CommittedFiles:  make(map[string]string),
+		Versions:        []VersionGroup{},
+		NextCommitID:    1,
+		NextVerID:       1,
+		CurrentBranch:   "main",
+		AuditLog:        []string{},
+		storage:         storage,
+		DeployedVersion: nil,
 	}
-	// Load persisted baseline and branch.
-	if base, err := storage.LoadCommittedFiles(); err == nil {
-		vm.committedFiles = base
+	// Attempt to load previous state.
+	if state, err := storage.LoadState(); err == nil {
+		vm.LatestFiles = state.LatestFiles
+		vm.FileVersions = state.FileVersions
+		vm.PendingCommits = state.PendingCommits
+		vm.CommittedFiles = state.CommittedFiles
+		vm.Versions = state.Versions
+		vm.NextCommitID = state.NextCommitID
+		vm.NextVerID = state.NextVerID
+		vm.CurrentBranch = state.CurrentBranch
+		vm.AuditLog = state.AuditLog
+		log.Println("Loaded persisted state.")
+	} else {
+		log.Println("No previous state found; starting new.")
+		vm.persistState()
 	}
-	if branch, err := storage.LoadBranch(); err == nil {
-		vm.currentBranch = branch
-	}
-	// NOTE: Loading commits, versions, and audit log is possible if desired.
 	return vm
 }
 
@@ -235,7 +195,7 @@ var versionManager *VersionManager
 
 // --- Diff and Merge Functions ---
 
-// formatDiff returns a unified diff string from diffmatchpatch diff results.
+// formatDiff produces a unified diff string using diffmatchpatch.
 func formatDiff(diffs []diffmatchpatch.Diff) string {
 	var result strings.Builder
 	for _, d := range diffs {
@@ -264,8 +224,8 @@ func formatDiff(diffs []diffmatchpatch.Diff) string {
 	return result.String()
 }
 
-// mergeFileVersions applies each candidate’s changes sequentially as a patch
-// to the currently merged result. If any patch fails to apply, a conflict is declared.
+// mergeFileVersions applies each candidate’s change (using patching) sequentially to the base.
+// Returns the final merged content and a conflict flag.
 func mergeFileVersions(base string, candidates []string) (string, bool) {
 	merged := base
 	dmp := diffmatchpatch.New()
@@ -289,13 +249,12 @@ func mergeFileVersions(base string, candidates []string) (string, bool) {
 
 // --- Deployment Function ---
 
-// deployVersion writes files to a temporary folder then atomically swaps it with production.
+// deployVersion stages files to a temporary folder and atomically swaps it with production.
 func deployVersion(ver VersionGroup) error {
 	tempDir := "Prod_temp"
 	if err := os.RemoveAll(tempDir); err != nil {
 		return fmt.Errorf("failed to clear temp folder: %v", err)
 	}
-	// Create temporary directory structure and write files.
 	for srcPath, fileVersion := range ver.Files {
 		relPath := strings.TrimPrefix(srcPath, "configs/")
 		destPath := filepath.Join(tempDir, relPath)
@@ -303,7 +262,6 @@ func deployVersion(ver VersionGroup) error {
 		if err := os.MkdirAll(destDir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %v", destDir, err)
 		}
-		// Do not write files marked as deleted.
 		if fileVersion.Deleted {
 			continue
 		}
@@ -314,7 +272,6 @@ func deployVersion(ver VersionGroup) error {
 	}
 	prodDir := "Prod"
 	backupDir := "Prod_backup"
-	// Backup current production.
 	if _, err := os.Stat(prodDir); err == nil {
 		os.RemoveAll(backupDir)
 		if err := os.Rename(prodDir, backupDir); err != nil {
@@ -330,31 +287,29 @@ func deployVersion(ver VersionGroup) error {
 	return nil
 }
 
-// --- VersionManager Methods ---
+// --- Version Manager Methods ---
+// Each method that changes state calls persistState() to write the latest state.
 
-// UpdateFile records file changes; if content is empty it is a deletion.
 func (vm *VersionManager) UpdateFile(path, content string, deleted bool) {
 	vm.Lock()
 	defer vm.Unlock()
 	version := FileVersion{Timestamp: time.Now(), Content: content, Deleted: deleted}
-	vm.latestFiles[path] = content
-	vm.fileVersions[path] = append(vm.fileVersions[path], version)
+	vm.LatestFiles[path] = content
+	vm.FileVersions[path] = append(vm.FileVersions[path], version)
 	entry := fmt.Sprintf("%s updated at %s (deleted=%v)", path, time.Now().Format(time.RFC3339), deleted)
-	vm.auditLog = append(vm.auditLog, entry)
-	// Append audit record.
-	_ = vm.storage.AppendAudit(entry)
+	vm.AuditLog = append(vm.AuditLog, entry)
+	_ = vm.persistState()
 	log.Printf("File updated: %s (deleted=%v)", path, deleted)
 }
 
-// GetChanges computes the diff between the latest file state and the last committed state.
 func (vm *VersionManager) GetChanges() map[string]string {
 	vm.RLock()
 	defer vm.RUnlock()
 	changes := make(map[string]string)
 	dmp := diffmatchpatch.New()
-	for file, versions := range vm.fileVersions {
+	for file, versions := range vm.FileVersions {
 		baseline := ""
-		if c, ok := vm.committedFiles[file]; ok {
+		if c, ok := vm.CommittedFiles[file]; ok {
 			baseline = strings.TrimSpace(c)
 		}
 		latest := strings.TrimSpace(versions[len(versions)-1].Content)
@@ -374,22 +329,21 @@ func (vm *VersionManager) GetChanges() map[string]string {
 	return changes
 }
 
-// CreateCommit creates a commit for the selected files on the current branch.
 func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) Commit {
 	vm.Lock()
 	defer vm.Unlock()
 	dmp := diffmatchpatch.New()
 	commit := Commit{
-		ID:        vm.nextCommitID,
+		ID:        vm.NextCommitID,
 		Timestamp: time.Now(),
 		Message:   message,
-		Branch:    vm.currentBranch,
+		Branch:    vm.CurrentBranch,
 		Files:     make(map[string]FileVersion),
 	}
 	for _, file := range selectedFiles {
-		if versions, exists := vm.fileVersions[file]; exists && len(versions) > 0 {
+		if versions, exists := vm.FileVersions[file]; exists && len(versions) > 0 {
 			baseline := ""
-			if c, ok := vm.committedFiles[file]; ok {
+			if c, ok := vm.CommittedFiles[file]; ok {
 				baseline = strings.TrimSpace(c)
 			}
 			currentVersion := versions[len(versions)-1]
@@ -404,32 +358,28 @@ func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) C
 				Deleted:   currentVersion.Deleted,
 			}
 			commit.Files[file] = fv
-			vm.committedFiles[file] = current
-			vm.fileVersions[file] = []FileVersion{{Timestamp: time.Now(), Content: current, Deleted: currentVersion.Deleted}}
+			vm.CommittedFiles[file] = current
+			vm.FileVersions[file] = []FileVersion{{Timestamp: time.Now(), Content: current, Deleted: currentVersion.Deleted}}
 		}
 	}
-	vm.commits = append(vm.commits, commit)
-	vm.nextCommitID++
-	entry := fmt.Sprintf("Commit %d created on branch '%s'", commit.ID, vm.currentBranch)
-	vm.auditLog = append(vm.auditLog, entry)
-	_ = vm.storage.AppendAudit(entry)
-	// Persist committedFiles.
-	_ = vm.storage.SaveCommittedFiles(vm.committedFiles)
-	// Save commit.
-	_ = vm.storage.SaveEntity(commitsBucket, commit.ID, commit)
-	log.Printf("Created commit %d on branch '%s': %s", commit.ID, vm.currentBranch, message)
+	vm.PendingCommits = append(vm.PendingCommits, commit)
+	vm.NextCommitID++
+	// Record audit entry.
+	entry := fmt.Sprintf("Commit %d created on branch '%s'", commit.ID, vm.CurrentBranch)
+	vm.AuditLog = append(vm.AuditLog, entry)
+	_ = vm.persistState()
+	log.Printf("Created commit %d on branch '%s': %s", commit.ID, vm.CurrentBranch, message)
 	return commit
 }
 
-// MergeCommits merges all pending commits (for the current branch) into a version group.
 func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 	vm.Lock()
 	defer vm.Unlock()
 	var mergedMsg []string
-	fileCommits := make(map[string][]string) // candidates for each file
+	fileCommits := make(map[string][]string)
 	var conflicts []string
-	for _, commit := range vm.commits {
-		if commit.Branch != vm.currentBranch {
+	for _, commit := range vm.PendingCommits {
+		if commit.Branch != vm.CurrentBranch {
 			continue
 		}
 		mergedMsg = append(mergedMsg, fmt.Sprintf("Commit %d: %s", commit.ID, commit.Message))
@@ -442,7 +392,7 @@ func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 	dmp := diffmatchpatch.New()
 	for file, candidates := range fileCommits {
 		base := ""
-		if b, ok := vm.committedFiles[file]; ok {
+		if b, ok := vm.CommittedFiles[file]; ok {
 			base = strings.TrimSpace(b)
 		}
 		merged, conflict := mergeFileVersions(base, candidates)
@@ -461,33 +411,30 @@ func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 		return VersionGroup{}, fmt.Errorf("merge conflict in files: %s", strings.Join(conflicts, ", "))
 	}
 	mergedVersion := VersionGroup{
-		ID:            vm.nextVerID,
+		ID:            vm.NextVerID,
 		Tag:           tag,
 		CommitMessage: strings.Join(mergedMsg, " | "),
 		Timestamp:     time.Now(),
-		Branch:        vm.currentBranch,
+		Branch:        vm.CurrentBranch,
 		Files:         mergedFiles,
 	}
-	vm.versions = append(vm.versions, mergedVersion)
-	vm.nextVerID++
-	// Remove merged commits for current branch.
-	var remainingCommits []Commit
-	for _, commit := range vm.commits {
-		if commit.Branch != vm.currentBranch {
-			remainingCommits = append(remainingCommits, commit)
+	vm.Versions = append(vm.Versions, mergedVersion)
+	vm.NextVerID++
+	// Remove merged commits (only for current branch).
+	var remaining []Commit
+	for _, commit := range vm.PendingCommits {
+		if commit.Branch != vm.CurrentBranch {
+			remaining = append(remaining, commit)
 		}
 	}
-	vm.commits = remainingCommits
-	entry := fmt.Sprintf("Merged commits on branch '%s' into version %d", vm.currentBranch, mergedVersion.ID)
-	vm.auditLog = append(vm.auditLog, entry)
-	_ = vm.storage.AppendAudit(entry)
-	// Persist the merged version.
-	_ = vm.storage.SaveEntity(versionsBucket, mergedVersion.ID, mergedVersion)
-	log.Printf("Created version %d on branch '%s' with tag '%s'", mergedVersion.ID, vm.currentBranch, tag)
+	vm.PendingCommits = remaining
+	entry := fmt.Sprintf("Merged commits on branch '%s' into version %d", vm.CurrentBranch, mergedVersion.ID)
+	vm.AuditLog = append(vm.AuditLog, entry)
+	_ = vm.persistState()
+	log.Printf("Created version %d on branch '%s' with tag '%s'", mergedVersion.ID, vm.CurrentBranch, tag)
 	return mergedVersion, nil
 }
 
-// MergeSelectedCommits merges only the commits identified by commitIDs.
 func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (VersionGroup, error) {
 	vm.Lock()
 	defer vm.Unlock()
@@ -498,10 +445,10 @@ func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (Ver
 	for _, id := range commitIDs {
 		selectedMap[id] = true
 	}
-	var remainingCommits []Commit
-	for _, commit := range vm.commits {
-		if commit.Branch != vm.currentBranch {
-			remainingCommits = append(remainingCommits, commit)
+	var remaining []Commit
+	for _, commit := range vm.PendingCommits {
+		if commit.Branch != vm.CurrentBranch {
+			remaining = append(remaining, commit)
 			continue
 		}
 		if selectedMap[commit.ID] {
@@ -510,14 +457,14 @@ func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (Ver
 				fileCommits[file] = append(fileCommits[file], strings.TrimSpace(fv.Content))
 			}
 		} else {
-			remainingCommits = append(remainingCommits, commit)
+			remaining = append(remaining, commit)
 		}
 	}
 	mergedFiles := make(map[string]FileVersion)
 	dmp := diffmatchpatch.New()
 	for file, candidates := range fileCommits {
 		base := ""
-		if b, ok := vm.committedFiles[file]; ok {
+		if b, ok := vm.CommittedFiles[file]; ok {
 			base = strings.TrimSpace(b)
 		}
 		merged, conflict := mergeFileVersions(base, candidates)
@@ -536,57 +483,53 @@ func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (Ver
 		return VersionGroup{}, fmt.Errorf("merge conflict in files: %s", strings.Join(conflicts, ", "))
 	}
 	mergedVersion := VersionGroup{
-		ID:            vm.nextVerID,
+		ID:            vm.NextVerID,
 		Tag:           tag,
 		CommitMessage: strings.Join(mergedMsg, " | "),
 		Timestamp:     time.Now(),
-		Branch:        vm.currentBranch,
+		Branch:        vm.CurrentBranch,
 		Files:         mergedFiles,
 	}
-	vm.versions = append(vm.versions, mergedVersion)
-	vm.nextVerID++
-	vm.commits = remainingCommits
-	entry := fmt.Sprintf("Merged selected commits on branch '%s' into version %d", vm.currentBranch, mergedVersion.ID)
-	vm.auditLog = append(vm.auditLog, entry)
-	_ = vm.storage.AppendAudit(entry)
-	_ = vm.storage.SaveEntity(versionsBucket, mergedVersion.ID, mergedVersion)
-	log.Printf("Created version %d on branch '%s' with tag '%s' merging commits: %v", mergedVersion.ID, vm.currentBranch, tag, commitIDs)
+	vm.Versions = append(vm.Versions, mergedVersion)
+	vm.NextVerID++
+	vm.PendingCommits = remaining
+	entry := fmt.Sprintf("Merged selected commits on branch '%s' into version %d", vm.CurrentBranch, mergedVersion.ID)
+	vm.AuditLog = append(vm.AuditLog, entry)
+	_ = vm.persistState()
+	log.Printf("Created version %d on branch '%s' with tag '%s' merging commits: %v", mergedVersion.ID, vm.CurrentBranch, tag, commitIDs)
 	return mergedVersion, nil
 }
 
-// RevertPendingCommits discards pending commits on the current branch.
 func (vm *VersionManager) RevertPendingCommits() {
 	vm.Lock()
 	defer vm.Unlock()
 	var remaining []Commit
-	for _, commit := range vm.commits {
-		if commit.Branch != vm.currentBranch {
+	for _, commit := range vm.PendingCommits {
+		if commit.Branch != vm.CurrentBranch {
 			remaining = append(remaining, commit)
 		}
 	}
-	vm.commits = remaining
-	entry := fmt.Sprintf("Pending commits on branch '%s' reverted.", vm.currentBranch)
-	vm.auditLog = append(vm.auditLog, entry)
-	_ = vm.storage.AppendAudit(entry)
+	vm.PendingCommits = remaining
+	entry := fmt.Sprintf("Pending commits on branch '%s' reverted.", vm.CurrentBranch)
+	vm.AuditLog = append(vm.AuditLog, entry)
+	_ = vm.persistState()
 	log.Println("Pending commits reverted.")
 }
 
-// AbortMerge logs that a merge was aborted.
 func (vm *VersionManager) AbortMerge() {
 	vm.Lock()
 	defer vm.Unlock()
-	entry := fmt.Sprintf("Merge aborted on branch '%s'", vm.currentBranch)
-	vm.auditLog = append(vm.auditLog, entry)
-	_ = vm.storage.AppendAudit(entry)
+	entry := fmt.Sprintf("Merge aborted on branch '%s'", vm.CurrentBranch)
+	vm.AuditLog = append(vm.AuditLog, entry)
+	_ = vm.persistState()
 	log.Println("Merge aborted. No changes applied.")
 }
 
-// GetDiff returns a diff between the stored file and new content.
 func (vm *VersionManager) GetDiff(filePath, newContent string) string {
 	vm.RLock()
 	defer vm.RUnlock()
 	baseline := ""
-	if content, ok := vm.latestFiles[filePath]; ok {
+	if content, ok := vm.LatestFiles[filePath]; ok {
 		baseline = content
 	}
 	dmp := diffmatchpatch.New()
@@ -595,25 +538,22 @@ func (vm *VersionManager) GetDiff(filePath, newContent string) string {
 	return formatDiff(diffs)
 }
 
-// SwitchBranch changes the current branch and persists it.
 func (vm *VersionManager) SwitchBranch(branch string) {
 	vm.Lock()
 	defer vm.Unlock()
-	vm.currentBranch = branch
+	vm.CurrentBranch = branch
 	entry := fmt.Sprintf("Switched to branch '%s'", branch)
-	vm.auditLog = append(vm.auditLog, entry)
-	_ = vm.storage.AppendAudit(entry)
-	_ = vm.storage.SaveBranch(branch)
+	vm.AuditLog = append(vm.AuditLog, entry)
+	_ = vm.persistState()
 	log.Printf("Switched to branch: %s", branch)
 }
 
-// RollbackDeployment reverts production to an earlier version and resets the baseline.
 func (vm *VersionManager) RollbackDeployment(versionID int) error {
 	vm.Lock()
 	defer vm.Unlock()
 	var target *VersionGroup
-	for _, ver := range vm.versions {
-		if ver.ID == versionID && ver.Branch == vm.currentBranch {
+	for _, ver := range vm.Versions {
+		if ver.ID == versionID && ver.Branch == vm.CurrentBranch {
 			target = &ver
 			break
 		}
@@ -624,17 +564,15 @@ func (vm *VersionManager) RollbackDeployment(versionID int) error {
 	if err := deployVersion(*target); err != nil {
 		return err
 	}
-	// Reset baseline committed files to target version.
 	for file, fv := range target.Files {
-		vm.committedFiles[file] = fv.Content
-		vm.fileVersions[file] = []FileVersion{{Timestamp: time.Now(), Content: fv.Content, Deleted: fv.Deleted}}
+		vm.CommittedFiles[file] = fv.Content
+		vm.FileVersions[file] = []FileVersion{{Timestamp: time.Now(), Content: fv.Content, Deleted: fv.Deleted}}
 	}
-	vm.commits = []Commit{}
-	vm.deployedVersion = target
-	entry := fmt.Sprintf("Rolled back deployment to version %d on branch '%s'", target.ID, vm.currentBranch)
-	vm.auditLog = append(vm.auditLog, entry)
-	_ = vm.storage.AppendAudit(entry)
-	_ = vm.storage.SaveCommittedFiles(vm.committedFiles)
+	vm.PendingCommits = []Commit{}
+	vm.DeployedVersion = target
+	entry := fmt.Sprintf("Rolled back deployment to version %d on branch '%s'", target.ID, vm.CurrentBranch)
+	vm.AuditLog = append(vm.AuditLog, entry)
+	_ = vm.persistState()
 	log.Printf("Rolled back deployment to version %d", target.ID)
 	return nil
 }
@@ -699,7 +637,7 @@ func watchFiles(paths []string) {
 	}
 }
 
-// --- HTTP Handlers and Basic Auth Middleware ---
+// --- HTTP Handlers and Basic Auth ---
 
 func basicAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -736,7 +674,7 @@ func handleCommit(w http.ResponseWriter, r *http.Request) {
 func handleGetCommits(w http.ResponseWriter, r *http.Request) {
 	versionManager.RLock()
 	defer versionManager.RUnlock()
-	_ = json.NewEncoder(w).Encode(versionManager.commits)
+	_ = json.NewEncoder(w).Encode(versionManager.PendingCommits)
 }
 
 type VersionPayload struct {
@@ -789,7 +727,7 @@ func handleAbortMerge(w http.ResponseWriter, r *http.Request) {
 func handleGetVersions(w http.ResponseWriter, r *http.Request) {
 	versionManager.RLock()
 	defer versionManager.RUnlock()
-	_ = json.NewEncoder(w).Encode(versionManager.versions)
+	_ = json.NewEncoder(w).Encode(versionManager.Versions)
 }
 
 type SwitchVersionPayload struct {
@@ -805,8 +743,8 @@ func handleSwitchVersion(w http.ResponseWriter, r *http.Request) {
 	versionManager.Lock()
 	defer versionManager.Unlock()
 	var selected *VersionGroup
-	for _, ver := range versionManager.versions {
-		if ver.ID == payload.VersionID && ver.Branch == versionManager.currentBranch {
+	for _, ver := range versionManager.Versions {
+		if ver.ID == payload.VersionID && ver.Branch == versionManager.CurrentBranch {
 			selected = &ver
 			break
 		}
@@ -819,11 +757,11 @@ func handleSwitchVersion(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to deploy version: %v", err), http.StatusInternalServerError)
 		return
 	}
-	// For switching version, do not reset baseline.
-	versionManager.deployedVersion = selected
-	entry := fmt.Sprintf("Switched to deployed version %d on branch '%s'", selected.ID, versionManager.currentBranch)
-	versionManager.auditLog = append(versionManager.auditLog, entry)
-	_ = versionManager.storage.AppendAudit(entry)
+	// For switching, we do not alter the committed baseline.
+	versionManager.DeployedVersion = selected
+	entry := fmt.Sprintf("Switched to deployed version %d on branch '%s'", selected.ID, versionManager.CurrentBranch)
+	versionManager.AuditLog = append(versionManager.AuditLog, entry)
+	_ = versionManager.persistState()
 	log.Printf("Switched to deployed version %d", selected.ID)
 	_ = json.NewEncoder(w).Encode(selected)
 }
@@ -831,11 +769,11 @@ func handleSwitchVersion(w http.ResponseWriter, r *http.Request) {
 func handleDeployedVersion(w http.ResponseWriter, r *http.Request) {
 	versionManager.RLock()
 	defer versionManager.RUnlock()
-	if versionManager.deployedVersion == nil {
+	if versionManager.DeployedVersion == nil {
 		http.Error(w, "No deployed version", http.StatusNotFound)
 		return
 	}
-	_ = json.NewEncoder(w).Encode(versionManager.deployedVersion)
+	_ = json.NewEncoder(w).Encode(versionManager.DeployedVersion)
 }
 
 type SwitchBranchPayload struct {
@@ -875,16 +813,16 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	// Initialize storage.
-	st, err := NewStorage(dbFile)
+	storage, err := NewStorage(dbFile)
 	if err != nil {
 		log.Fatalf("Error opening storage: %v", err)
 	}
-	defer st.db.Close()
-	// Initialize VersionManager.
-	versionManager = NewVersionManager(st)
+	defer storage.db.Close()
+	// Initialize version manager.
+	versionManager = NewVersionManager(storage)
 	// Start file watcher.
 	go watchFiles(watchPaths)
-	// HTTP routes.
+	// Set up HTTP routes with basic auth for sensitive endpoints.
 	http.HandleFunc("/api/changes", basicAuth(handleChanges))
 	http.HandleFunc("/api/commit", basicAuth(handleCommit))
 	http.HandleFunc("/api/commits", basicAuth(handleGetCommits))
