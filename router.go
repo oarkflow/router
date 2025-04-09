@@ -144,7 +144,7 @@ type StaticConfig struct {
 
 // Router represents the HTTP router.
 type Router struct {
-	app          *fiber.App
+	app          fiber.Router
 	routes       sync.Map // key: string (HTTP method) -> *methodRoutes
 	staticRoutes []Static
 	// GlobalMiddlewares are applied to every route.
@@ -156,12 +156,11 @@ type Router struct {
 }
 
 // New creates and returns a new Router instance.
-func New(app *fiber.App) *Router {
+func New(app fiber.Router) *Router {
 	dr := &Router{
 		app:         app,
 		staticCache: make(map[string]staticCacheEntry),
 	}
-
 	app.Use(func(c *fiber.Ctx) error {
 		err := c.Next()
 		if err != nil {
@@ -591,12 +590,6 @@ func (dr *Router) InvalidateStaticCache(file string) {
 	defer dr.staticCacheLock.Unlock()
 	delete(dr.staticCache, file)
 	log.Info().Str("file", file).Msg("Invalidated static cache")
-}
-
-// Shutdown initiates a graceful shutdown of the router.
-func (dr *Router) Shutdown() error {
-	log.Info().Msg("Initiating graceful shutdown")
-	return dr.app.Shutdown()
 }
 
 // GroupRoute represents a route defined within a group.
