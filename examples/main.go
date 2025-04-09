@@ -238,7 +238,11 @@ func reloadHandler(c *fiber.Ctx) error {
 }
 
 func main() {
-
+	group := dynamicRouter.Group("/api")
+	v1 := group.Group("/v1")
+	v1.Get("/hello", func(c *fiber.Ctx) error {
+		return c.SendString("Hello from the test group!")
+	})
 	dynamicRouter.AddRoute("GET", "/hello", func(c *fiber.Ctx) error {
 		return c.SendString("Hello from the dynamic router!")
 	})

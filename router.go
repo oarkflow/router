@@ -223,7 +223,6 @@ func (dr *Router) Use(mw ...fiber.Handler) {
 	log.Info().Int("count", len(mw)).Msg("Added to global middleware")
 }
 
-// MatchRoute finds and returns a matching dynamic route.
 func (dr *Router) MatchRoute(method, path string) (*Route, bool, map[string]string) {
 	if v, ok := dr.routes.Load(method); ok {
 		mr := v.(*methodRoutes)
@@ -575,7 +574,7 @@ func (dr *Router) SetNotFoundHandler(handler fiber.Handler) {
 // ListRoutes returns a list of all registered dynamic routes.
 func (dr *Router) ListRoutes() []string {
 	var routesList []string
-	dr.routes.Range(func(key, value interface{}) bool {
+	dr.routes.Range(func(key, value any) bool {
 		method := key.(string)
 		mr := value.(*methodRoutes)
 		mr.mu.RLock()
@@ -617,6 +616,7 @@ type GroupRoute struct {
 type Group struct {
 	// prefix is the base URL segment for the group.
 	prefix string
+	name   string
 	// middlewares are applied to all routes in the group.
 	middlewares []middlewareEntry
 	// routes are the routes belonging to the group.
@@ -624,8 +624,104 @@ type Group struct {
 	router *Router
 }
 
+func (g *Group) Use(args ...any) fiber.Router {
+	return g.AddMiddleware(args...)
+}
+
+func getHandlers(handlers ...fiber.Handler) (fiber.Handler, []fiber.Handler) {
+	if len(handlers) == 0 {
+		return nil, nil
+	}
+	last := handlers[len(handlers)-1]
+	rest := handlers[:len(handlers)-1]
+	return last, rest
+}
+
+func (g *Group) Get(path string, handlers ...fiber.Handler) fiber.Router {
+	last, rest := getHandlers(handlers...)
+	return g.AddRoute("GET", path, last, rest...)
+}
+
+func (g *Group) Head(path string, handlers ...fiber.Handler) fiber.Router {
+	last, rest := getHandlers(handlers...)
+	return g.AddRoute("HEAD", path, last, rest...)
+}
+
+func (g *Group) Post(path string, handlers ...fiber.Handler) fiber.Router {
+	last, rest := getHandlers(handlers...)
+	return g.AddRoute("POST", path, last, rest...)
+}
+
+func (g *Group) Put(path string, handlers ...fiber.Handler) fiber.Router {
+	last, rest := getHandlers(handlers...)
+	return g.AddRoute("PUT", path, last, rest...)
+}
+
+func (g *Group) Delete(path string, handlers ...fiber.Handler) fiber.Router {
+	last, rest := getHandlers(handlers...)
+	return g.AddRoute("DELETE", path, last, rest...)
+}
+
+func (g *Group) Connect(path string, handlers ...fiber.Handler) fiber.Router {
+	last, rest := getHandlers(handlers...)
+	return g.AddRoute("CONNECT", path, last, rest...)
+}
+
+func (g *Group) Options(path string, handlers ...fiber.Handler) fiber.Router {
+	last, rest := getHandlers(handlers...)
+	return g.AddRoute("OPTIONS", path, last, rest...)
+}
+
+func (g *Group) Trace(path string, handlers ...fiber.Handler) fiber.Router {
+	last, rest := getHandlers(handlers...)
+	return g.AddRoute("TRACE", path, last, rest...)
+}
+
+func (g *Group) Patch(path string, handlers ...fiber.Handler) fiber.Router {
+	last, rest := getHandlers(handlers...)
+	return g.AddRoute("PATCH", path, last, rest...)
+}
+
+func (g *Group) Add(method, path string, handlers ...fiber.Handler) fiber.Router {
+	last, rest := getHandlers(handlers...)
+	return g.AddRoute(method, path, last, rest...)
+}
+
+func (g *Group) Static(prefix, root string, config ...fiber.Static) fiber.Router {
+	fullPrefix := g.prefix + prefix
+	g.Static(fullPrefix, root, config...)
+	return g
+}
+
+func (g *Group) All(path string, handlers ...fiber.Handler) fiber.Router {
+	for _, method := range fiber.DefaultMethods {
+		last, rest := getHandlers(handlers...)
+		g.AddRoute(method, path, last, rest...)
+	}
+	return g
+}
+
+func (g *Group) Route(prefix string, fn func(router fiber.Router), name ...string) fiber.Router {
+	group := g.Group(prefix)
+	if len(name) > 0 {
+		group.Name(name[0])
+	}
+	fn(group)
+	return group
+}
+
+func (g *Group) Mount(prefix string, fiber *fiber.App) fiber.Router {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (g *Group) Name(name string) fiber.Router {
+	g.name = name
+	return g
+}
+
 // Group creates a new subgroup with an additional prefix.
-func (g *Group) Group(prefix string, m ...fiber.Handler) *Group {
+func (g *Group) Group(prefix string, m ...fiber.Handler) fiber.Router {
 	newPrefix := g.prefix + prefix
 	newMW := make([]middlewareEntry, len(g.middlewares))
 	copy(newMW, g.middlewares)
@@ -640,7 +736,7 @@ func (g *Group) Group(prefix string, m ...fiber.Handler) *Group {
 }
 
 // AddRoute adds a new route to the group.
-func (g *Group) AddRoute(method, relPath string, handler fiber.Handler, m ...fiber.Handler) {
+func (g *Group) AddRoute(method, relPath string, handler fiber.Handler, m ...fiber.Handler) fiber.Router {
 	effectivePath := g.prefix + relPath
 	var routeMWs []middlewareEntry
 	for _, mw := range m {
@@ -662,47 +758,7 @@ func (g *Group) AddRoute(method, relPath string, handler fiber.Handler, m ...fib
 		combinedMW = append(combinedMW, m.handler)
 	}
 	g.router.AddRoute(method, effectivePath, handler, combinedMW...)
-}
-
-// Get adds a new GET route to the group.
-func (g *Group) Get(relPath string, handler fiber.Handler, m ...fiber.Handler) {
-	g.AddRoute("GET", relPath, handler, m...)
-}
-
-// Post adds a new POST route to the group.
-func (g *Group) Post(relPath string, handler fiber.Handler, m ...fiber.Handler) {
-	g.AddRoute("POST", relPath, handler, m...)
-}
-
-// Put adds a new PUT route to the group.
-func (g *Group) Put(relPath string, handler fiber.Handler, m ...fiber.Handler) {
-	g.AddRoute("PUT", relPath, handler, m...)
-}
-
-// Delete adds a new DELETE route to the group.
-func (g *Group) Delete(relPath string, handler fiber.Handler, m ...fiber.Handler) {
-	g.AddRoute("DELETE", relPath, handler, m...)
-}
-
-// Patch adds a new PATCH route to the group.
-func (g *Group) Patch(relPath string, handler fiber.Handler, m ...fiber.Handler) {
-	g.AddRoute("PATCH", relPath, handler, m...)
-}
-
-// Options adds a new OPTIONS route to the group.
-func (g *Group) Options(relPath string, handler fiber.Handler, m ...fiber.Handler) {
-	g.AddRoute("OPTIONS", relPath, handler, m...)
-}
-
-// Head adds a new HEAD route to the group.
-func (g *Group) Head(relPath string, handler fiber.Handler, m ...fiber.Handler) {
-	g.AddRoute("HEAD", relPath, handler, m...)
-}
-
-// Static adds a new static route within the group.
-func (g *Group) Static(prefix, directory string, cfg ...StaticConfig) {
-	fullPrefix := g.prefix + prefix
-	g.router.Static(fullPrefix, directory, cfg...)
+	return g
 }
 
 // ChangePrefix updates the group's prefix and the effective path of its routes.
@@ -722,10 +778,13 @@ func (g *Group) ChangePrefix(newPrefix string) {
 }
 
 // UpdateMiddlewares updates the group's middlewares.
-func (g *Group) UpdateMiddlewares(newMW []fiber.Handler) {
+func (g *Group) UpdateMiddlewares(newMW []any) {
 	var newWrapped []middlewareEntry
 	for _, m := range newMW {
-		newWrapped = append(newWrapped, wrapMiddleware(m))
+		mw, ok := m.(fiber.Handler)
+		if ok {
+			newWrapped = append(newWrapped, wrapMiddleware(mw))
+		}
 	}
 	g.middlewares = newWrapped
 	for _, gr := range g.routes {
@@ -743,18 +802,19 @@ func (g *Group) UpdateMiddlewares(newMW []fiber.Handler) {
 }
 
 // AddMiddleware adds new middleware to the group.
-func (g *Group) AddMiddleware(mw ...fiber.Handler) {
-	current := make([]fiber.Handler, 0, len(g.middlewares))
+func (g *Group) AddMiddleware(mw ...any) fiber.Router {
+	current := make([]any, 0, len(g.middlewares))
 	for _, m := range g.middlewares {
 		current = append(current, m.handler)
 	}
 	current = append(current, mw...)
 	g.UpdateMiddlewares(current)
+	return g
 }
 
 // RemoveMiddleware removes middleware from the group.
 func (g *Group) RemoveMiddleware(mw ...fiber.Handler) {
-	var newMW []fiber.Handler
+	var newMW []any
 	for _, m := range g.middlewares {
 		keep := true
 		for _, rm := range mw {
