@@ -123,6 +123,7 @@ type Static struct {
 	Prefix           string `json:"prefix"`
 	Directory        string `json:"directory"`
 	CacheControl     string
+	Index            string
 	DirectoryListing bool
 	CompressionLevel int
 }
@@ -140,6 +141,7 @@ type StaticConfig struct {
 	CacheControl     string
 	DirectoryListing bool
 	CompressionLevel int
+	Index            string
 }
 
 // Router represents the HTTP router.
@@ -532,6 +534,7 @@ func (dr *Router) Static(prefix, directory string, cfg ...StaticConfig) {
 		CacheControl:     cacheControl,
 		DirectoryListing: sc.DirectoryListing,
 		CompressionLevel: sc.CompressionLevel,
+		Index:            sc.Index,
 	})
 	log.Info().Str("prefix", prefix).Str("directory", directory).Msg("Added static route")
 }
