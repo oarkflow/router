@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -19,13 +18,12 @@ import (
 )
 
 const (
-	Username = "admin"       // set via environment or secure configuration
-	Password = "supersecret" // set via environment or secure configuration
+	Username = "admin"
+	Password = "supersecret"
 )
 
 var watchPaths = []string{"./configs"}
 
-// FileVersion holds content and diff info. If Deleted is true, then content is empty.
 type FileVersion struct {
 	Timestamp time.Time `json:"timestamp"`
 	Content   string    `json:"content"`
@@ -33,7 +31,6 @@ type FileVersion struct {
 	Deleted   bool      `json:"deleted,omitempty"`
 }
 
-// Commit holds a commit with associated file versions and branch info.
 type Commit struct {
 	ID        int                    `json:"id"`
 	Timestamp time.Time              `json:"timestamp"`
@@ -42,7 +39,6 @@ type Commit struct {
 	Files     map[string]FileVersion `json:"files"`
 }
 
-// VersionGroup holds a merged version snapshot.
 type VersionGroup struct {
 	ID            int                    `json:"id"`
 	Tag           string                 `json:"tag,omitempty"`
@@ -52,19 +48,18 @@ type VersionGroup struct {
 	Files         map[string]FileVersion `json:"files"`
 }
 
-// VersionManager holds all commit and version data.
 type VersionManager struct {
 	sync.RWMutex
-	latestFiles     map[string]string        // latest known content (for diff calculations)
-	fileVersions    map[string][]FileVersion // history of file versions (per file)
-	commits         []Commit                 // pending commits (in current branch)
-	nextCommitID    int                      // auto-increment commit id
-	versions        []VersionGroup           // merged versions (all branches)
-	nextVerID       int                      // auto-increment version group id
-	committedFiles  map[string]string        // latest committed file contents (per branch)
-	deployedVersion *VersionGroup            // currently deployed version (in production)
-	currentBranch   string                   // current branch name (e.g., "main", "feature")
-	auditLog        []string                 // simple audit log
+	latestFiles     map[string]string
+	fileVersions    map[string][]FileVersion
+	commits         []Commit
+	nextCommitID    int
+	versions        []VersionGroup
+	nextVerID       int
+	committedFiles  map[string]string
+	deployedVersion *VersionGroup
+	currentBranch   string
+	auditLog        []string
 }
 
 func NewVersionManager() *VersionManager {
@@ -84,7 +79,6 @@ func NewVersionManager() *VersionManager {
 
 var versionManager = NewVersionManager()
 
-// formatDiff returns a unified diff string from diffmatchpatch diff results.
 func formatDiff(diffs []diffmatchpatch.Diff) string {
 	var result strings.Builder
 	for _, d := range diffs {
@@ -113,8 +107,6 @@ func formatDiff(diffs []diffmatchpatch.Diff) string {
 	return result.String()
 }
 
-// mergeFileVersions applies each candidate’s changes sequentially as a patch
-// to the currently merged result. If any patch fails, a conflict is declared.
 func mergeFileVersions(base string, candidates []string) (string, bool) {
 	merged := base
 	dmp := diffmatchpatch.New()
@@ -122,7 +114,6 @@ func mergeFileVersions(base string, candidates []string) (string, bool) {
 	for _, candidate := range candidates {
 		patch := dmp.PatchMake(merged, candidate)
 		result, applied := dmp.PatchApply(patch, merged)
-		// Check if all patch parts applied.
 		for _, ok := range applied {
 			if !ok {
 				conflictOccurred = true
@@ -137,13 +128,11 @@ func mergeFileVersions(base string, candidates []string) (string, bool) {
 	return merged, conflictOccurred
 }
 
-// deployVersion writes files to a temporary folder first then atomically swaps to production.
 func deployVersion(ver VersionGroup) error {
 	tempDir := "Prod_temp"
 	if err := os.RemoveAll(tempDir); err != nil {
 		return fmt.Errorf("failed to clear temp folder: %v", err)
 	}
-	// Write version files into temporary location.
 	for srcPath, fileVersion := range ver.Files {
 		relPath := strings.TrimPrefix(srcPath, "configs/")
 		destPath := filepath.Join(tempDir, relPath)
@@ -151,7 +140,6 @@ func deployVersion(ver VersionGroup) error {
 		if err := os.MkdirAll(destDir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %v", destDir, err)
 		}
-		// Do not write files marked as deleted.
 		if fileVersion.Deleted {
 			continue
 		}
@@ -160,10 +148,8 @@ func deployVersion(ver VersionGroup) error {
 		}
 		log.Printf("Staged %s", destPath)
 	}
-	// Swap temp folder to production atomically.
 	prodDir := "Prod"
 	backupDir := "Prod_backup"
-	// Backup current production.
 	if _, err := os.Stat(prodDir); err == nil {
 		os.RemoveAll(backupDir)
 		if err := os.Rename(prodDir, backupDir); err != nil {
@@ -171,7 +157,6 @@ func deployVersion(ver VersionGroup) error {
 		}
 	}
 	if err := os.Rename(tempDir, prodDir); err != nil {
-		// Attempt rollback.
 		os.Rename(backupDir, prodDir)
 		return fmt.Errorf("failed to deploy new version: %v", err)
 	}
@@ -180,7 +165,6 @@ func deployVersion(ver VersionGroup) error {
 	return nil
 }
 
-// UpdateFile records file changes. If content is empty, it is considered a deletion.
 func (vm *VersionManager) UpdateFile(path, content string, deleted bool) {
 	vm.Lock()
 	defer vm.Unlock()
@@ -191,7 +175,6 @@ func (vm *VersionManager) UpdateFile(path, content string, deleted bool) {
 	log.Printf("File updated: %s (deleted=%v)", path, deleted)
 }
 
-// GetChanges calculates diff between latest file state and last committed state.
 func (vm *VersionManager) GetChanges() map[string]string {
 	vm.RLock()
 	defer vm.RUnlock()
@@ -219,7 +202,6 @@ func (vm *VersionManager) GetChanges() map[string]string {
 	return changes
 }
 
-// CreateCommit creates a commit for selected files on the current branch.
 func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) Commit {
 	vm.Lock()
 	defer vm.Unlock()
@@ -260,12 +242,11 @@ func (vm *VersionManager) CreateCommit(selectedFiles []string, message string) C
 	return commit
 }
 
-// MergeCommits merges all pending commits (on current branch) into a version group.
 func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 	vm.Lock()
 	defer vm.Unlock()
 	var mergedMsg []string
-	fileCommits := make(map[string][]string) // list of candidate content strings per file
+	fileCommits := make(map[string][]string)
 	var conflicts []string
 	for _, commit := range vm.commits {
 		if commit.Branch != vm.currentBranch {
@@ -309,7 +290,6 @@ func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 	}
 	vm.versions = append(vm.versions, mergedVersion)
 	vm.nextVerID++
-	// Remove commits merged for current branch.
 	var remainingCommits []Commit
 	for _, commit := range vm.commits {
 		if commit.Branch != vm.currentBranch {
@@ -322,7 +302,6 @@ func (vm *VersionManager) MergeCommits(tag string) (VersionGroup, error) {
 	return mergedVersion, nil
 }
 
-// MergeSelectedCommits merges only the specified commits.
 func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (VersionGroup, error) {
 	vm.Lock()
 	defer vm.Unlock()
@@ -386,7 +365,6 @@ func (vm *VersionManager) MergeSelectedCommits(commitIDs []int, tag string) (Ver
 	return mergedVersion, nil
 }
 
-// RevertPendingCommits discards pending commits on the current branch.
 func (vm *VersionManager) RevertPendingCommits() {
 	vm.Lock()
 	defer vm.Unlock()
@@ -401,7 +379,6 @@ func (vm *VersionManager) RevertPendingCommits() {
 	log.Println("Pending commits reverted.")
 }
 
-// AbortMerge logs that a merge was aborted.
 func (vm *VersionManager) AbortMerge() {
 	vm.Lock()
 	defer vm.Unlock()
@@ -409,7 +386,6 @@ func (vm *VersionManager) AbortMerge() {
 	log.Println("Merge aborted. No changes applied.")
 }
 
-// GetDiff returns diff between stored file and new content.
 func (vm *VersionManager) GetDiff(filePath, newContent string) string {
 	vm.RLock()
 	defer vm.RUnlock()
@@ -423,7 +399,6 @@ func (vm *VersionManager) GetDiff(filePath, newContent string) string {
 	return formatDiff(diffs)
 }
 
-// SwitchBranch changes the current branch.
 func (vm *VersionManager) SwitchBranch(branch string) {
 	vm.Lock()
 	defer vm.Unlock()
@@ -432,7 +407,6 @@ func (vm *VersionManager) SwitchBranch(branch string) {
 	log.Printf("Switched to branch: %s", branch)
 }
 
-// RollbackDeployment reverts production to an earlier version and resets the committed state.
 func (vm *VersionManager) RollbackDeployment(versionID int) error {
 	vm.Lock()
 	defer vm.Unlock()
@@ -446,16 +420,13 @@ func (vm *VersionManager) RollbackDeployment(versionID int) error {
 	if target == nil {
 		return errors.New("version not found for rollback on current branch")
 	}
-	// Deploy the target version.
 	if err := deployVersion(*target); err != nil {
 		return err
 	}
-	// Reset committed state to target version.
 	for file, fv := range target.Files {
 		vm.committedFiles[file] = fv.Content
 		vm.fileVersions[file] = []FileVersion{{Timestamp: time.Now(), Content: fv.Content, Deleted: fv.Deleted}}
 	}
-	// Clear any pending commits.
 	vm.commits = []Commit{}
 	vm.deployedVersion = target
 	vm.auditLog = append(vm.auditLog, fmt.Sprintf("Rolled back deployment to version %d on branch '%s'", target.ID, vm.currentBranch))
@@ -463,7 +434,6 @@ func (vm *VersionManager) RollbackDeployment(versionID int) error {
 	return nil
 }
 
-// watchFiles monitors file system events including modifications, creations, deletions and renames.
 func watchFiles(paths []string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -497,14 +467,13 @@ func watchFiles(paths []string) {
 			if strings.HasSuffix(event.Name, "~") {
 				continue
 			}
-			// Handle deletion/rename events as file removal.
 			if event.Op&fsnotify.Remove != 0 || event.Op&fsnotify.Rename != 0 {
 				versionManager.UpdateFile(event.Name, "", true)
 				log.Printf("File removed: %s", event.Name)
 				continue
 			}
 			if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
-				data, err := ioutil.ReadFile(event.Name)
+				data, err := os.ReadFile(event.Name)
 				if err != nil {
 					log.Printf("Error reading %s: %v", event.Name, err)
 					continue
@@ -521,8 +490,6 @@ func watchFiles(paths []string) {
 		}
 	}
 }
-
-// ---- HTTP Handlers and basic auth middleware ----
 
 func basicAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -642,7 +609,6 @@ func handleSwitchVersion(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to deploy version: %v", err), http.StatusInternalServerError)
 		return
 	}
-	// For switching version, we do not alter the committed baseline.
 	versionManager.deployedVersion = selected
 	versionManager.auditLog = append(versionManager.auditLog, fmt.Sprintf("Switched to deployed version %d on branch '%s'", selected.ID, versionManager.currentBranch))
 	log.Printf("Switched to deployed version %d", selected.ID)
@@ -709,8 +675,8 @@ func main() {
 	http.HandleFunc("/api/branch/switch", basicAuth(handleSwitchBranch))
 	http.HandleFunc("/api/deployment/rollback", basicAuth(handleRollback))
 	http.HandleFunc("/", handleIndex)
-	fs := http.FileServer(http.Dir("./static"))
-	http.Handle("/static/", http.StripPrefix("/static/", fs))
+	f := http.FileServer(http.Dir("./static"))
+	http.Handle("/static/", http.StripPrefix("/static/", f))
 	addr := ":8080"
 	log.Printf("Server starting on %s", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
